@@ -498,6 +498,726 @@ namespace GpuToggle
         }
     }
 
+    // ------------------------------------------------------------------ PCIe link info (cfgmgr32 device properties)
+
+    class PcieLink
+    {
+        public string Device;          // device name of this end of the link
+        public int CurSpeed, CurWidth, MaxSpeed, MaxWidth;   // speed: 1 = Gen1 (2.5 GT/s) ... 5 = Gen5 (32 GT/s)
+
+        public static string Gen(int speed) { return speed > 0 ? "Gen" + speed : "?"; }
+
+        // Usable bandwidth per lane and direction in GB/s, after line encoding.
+        public static double LaneGBs(int speed)
+        {
+            switch (speed)
+            {
+                case 1: return 0.25;
+                case 2: return 0.5;
+                case 3: return 0.985;
+                case 4: return 1.969;
+                case 5: return 3.938;
+                case 6: return 7.563;
+                default: return 0;
+            }
+        }
+
+        public double CurGBs { get { return LaneGBs(CurSpeed) * CurWidth; } }
+        public double MaxGBs { get { return LaneGBs(MaxSpeed) * MaxWidth; } }
+        public string CurText { get { return Gen(CurSpeed) + " x" + CurWidth; } }
+        public string MaxText { get { return Gen(MaxSpeed) + " x" + MaxWidth; } }
+    }
+
+    static class Pcie
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        struct DEVPROPKEY { public Guid fmtid; public uint pid; }
+
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+        static extern int CM_Locate_DevNodeW(out uint devInst, string deviceId, uint flags);
+        [DllImport("cfgmgr32.dll")]
+        static extern int CM_Get_Parent(out uint parent, uint devInst, uint flags);
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+        static extern int CM_Get_DevNode_PropertyW(uint devInst, ref DEVPROPKEY key, out uint type, byte[] buffer, ref uint size, uint flags);
+
+        static readonly Guid PciKeys = new Guid("3ab22e31-8264-4b4e-9af5-a8d2d8e33e62");
+        static readonly Guid DevKeys = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0");   // DEVPKEY_Device_*
+
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+        static extern int CM_Get_Device_IDW(uint devInst, StringBuilder buffer, int len, uint flags);
+
+        static byte[] Prop(uint dev, Guid fmt, uint pid)
+        {
+            var k = new DEVPROPKEY();
+            k.fmtid = fmt;
+            k.pid = pid;
+            uint type, size = 0;
+            CM_Get_DevNode_PropertyW(dev, ref k, out type, null, ref size, 0);
+            if (size == 0) return null;
+            var buf = new byte[size];
+            if (CM_Get_DevNode_PropertyW(dev, ref k, out type, buf, ref size, 0) != 0) return null;
+            return buf;
+        }
+
+        static int U32(uint dev, uint pid)
+        {
+            byte[] b = Prop(dev, PciKeys, pid);
+            return b != null && b.Length >= 4 ? BitConverter.ToInt32(b, 0) : 0;
+        }
+
+        static string Name(uint dev)
+        {
+            byte[] b = Prop(dev, DevKeys, 14);                 // FriendlyName
+            if (b == null) b = Prop(dev, DevKeys, 2);          // DeviceDesc
+            return b == null ? "PCI device" : Encoding.Unicode.GetString(b).TrimEnd((char)0);
+        }
+
+        static PcieLink Read(uint dev)
+        {
+            var l = new PcieLink();
+            l.CurSpeed = U32(dev, 9);
+            l.CurWidth = U32(dev, 10);
+            l.MaxSpeed = U32(dev, 11);
+            l.MaxWidth = U32(dev, 12);
+            if (l.CurWidth <= 0 && l.MaxWidth <= 0) return null;
+            l.Device = Name(dev);
+            return l;
+        }
+
+        // Links from the GPU up to the root port. [0] is the GPU's own link (null if it has none, e.g. an iGPU).
+        public static List<PcieLink> Chain(string instanceId)
+        {
+            var chain = new List<PcieLink>();
+            uint dev;
+            if (CM_Locate_DevNodeW(out dev, instanceId, 0) != 0) return chain;
+            chain.Add(Read(dev));
+            for (int i = 0; i < 12; i++)
+            {
+                uint parent;
+                if (CM_Get_Parent(out parent, dev, 0) != 0) break;
+                dev = parent;
+                var l = Read(dev);
+                if (l != null) chain.Add(l);
+            }
+            return chain;
+        }
+
+        // Windows only reports link width/speed on endpoints, not on switch / root ports, so instead we look for
+        // a USB4 / Thunderbolt eGPU controller above the GPU. Its PCIe tunnel is usually the real limit.
+        static readonly string[] TunnelIds = {
+            "VEN_1B21&DEV_2461", "VEN_1B21&DEV_2463", "VEN_1B21&DEV_2464",      // ASMedia ASM2464 (USB4)
+            "VEN_8086&DEV_15E7", "VEN_8086&DEV_15EA", "VEN_8086&DEV_15EF",      // Intel Titan Ridge (TB3)
+            "VEN_8086&DEV_1133", "VEN_8086&DEV_1136", "VEN_8086&DEV_0B26",      // Intel Maple / Goshen Ridge (TB4)
+            "VEN_8086&DEV_1578", "VEN_8086&DEV_1576", "VEN_8086&DEV_15D3", "VEN_8086&DEV_15DA" };   // Alpine Ridge (TB3)
+
+        public static string Tunnel(string instanceId)
+        {
+            uint dev;
+            if (CM_Locate_DevNodeW(out dev, instanceId, 0) != 0) return null;
+            for (int i = 0; i < 12; i++)
+            {
+                uint parent;
+                if (CM_Get_Parent(out parent, dev, 0) != 0) break;
+                dev = parent;
+                var sb = new StringBuilder(512);
+                if (CM_Get_Device_IDW(dev, sb, sb.Capacity, 0) != 0) continue;
+                string id = sb.ToString().ToUpperInvariant();
+                string name = Name(dev);
+                foreach (var t in TunnelIds)
+                    if (id.Contains(t)) return (t.StartsWith("VEN_1B21", StringComparison.Ordinal) ? "USB4 (ASMedia ASM2464)" : "Thunderbolt (Intel)");
+                if (name.IndexOf("Thunderbolt", StringComparison.OrdinalIgnoreCase) >= 0) return "Thunderbolt";
+                if (name.IndexOf("USB4", StringComparison.OrdinalIgnoreCase) >= 0) return "USB4";
+            }
+            return null;
+        }
+    }
+
+    // ------------------------------------------------------------------ NVML: live PCIe traffic counters (NVIDIA only)
+
+    static class Nvml
+    {
+        [DllImport("nvml.dll")] static extern int nvmlInit_v2();
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetCount_v2(out uint count);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetHandleByIndex_v2(uint index, out IntPtr device);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetPciInfo_v3(IntPtr device, IntPtr pci);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetPcieThroughput(IntPtr device, int counter, out uint kbPerSec);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetCurrPcieLinkGeneration(IntPtr device, out uint gen);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetCurrPcieLinkWidth(IntPtr device, out uint width);
+
+        static bool tried, ok;
+
+        static bool Init()
+        {
+            if (!tried)
+            {
+                tried = true;
+                try { ok = nvmlInit_v2() == 0; } catch { ok = false; }
+            }
+            return ok;
+        }
+
+        // Handle of the NVIDIA GPU with this PCI vendor/device id, or IntPtr.Zero.
+        public static IntPtr Find(uint ven, uint dev)
+        {
+            if (!Init()) return IntPtr.Zero;
+            uint n;
+            if (nvmlDeviceGetCount_v2(out n) != 0) return IntPtr.Zero;
+            IntPtr buf = Marshal.AllocHGlobal(256);
+            try
+            {
+                for (uint i = 0; i < n; i++)
+                {
+                    IntPtr h;
+                    if (nvmlDeviceGetHandleByIndex_v2(i, out h) != 0) continue;
+                    for (int k = 0; k < 256; k++) Marshal.WriteByte(buf, k, 0);
+                    if (nvmlDeviceGetPciInfo_v3(h, buf) != 0) continue;
+                    uint id = (uint)Marshal.ReadInt32(buf, 28);   // pciDeviceId = device << 16 | vendor
+                    if (id == ((dev << 16) | ven)) return h;
+                }
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+            return IntPtr.Zero;
+        }
+
+        // Bytes per second over the last ~20 ms. rx = host -> GPU, tx = GPU -> host. False if unsupported.
+        public static bool Throughput(IntPtr h, out double rx, out double tx)
+        {
+            uint r, t;
+            rx = tx = 0;
+            if (nvmlDeviceGetPcieThroughput(h, 1, out r) != 0 || nvmlDeviceGetPcieThroughput(h, 0, out t) != 0) return false;
+            rx = r * 1024.0;
+            tx = t * 1024.0;
+            return true;
+        }
+
+        public static string Link(IntPtr h, out int gen, out int width)
+        {
+            uint g, w;
+            gen = width = 0;
+            if (nvmlDeviceGetCurrPcieLinkGeneration(h, out g) != 0 || nvmlDeviceGetCurrPcieLinkWidth(h, out w) != 0) return Txt.NA;
+            gen = (int)g; width = (int)w;
+            return "Gen" + g + " x" + w;
+        }
+    }
+
+    // ------------------------------------------------------------------ PCIe bandwidth test (D3D11 copies between system memory and VRAM)
+
+    class BandwidthResult
+    {
+        public string Error;
+        public double UploadGBs, DownloadGBs;     // host -> GPU, GPU -> host (best of several runs)
+        public List<PcieLink> Chain = new List<PcieLink>();       // links at idle
+        public List<PcieLink> ChainLoad;                           // links sampled while the test was running
+        public string Tunnel;                                      // USB4 / Thunderbolt controller above the GPU, if any
+        public double NvmlRxPeak, NvmlTxPeak;                      // NVML counter peaks (bytes/s) during the test = 100 % for the live monitor
+        public bool Integrated;
+    }
+
+    // Raw vtable calls, so we only need the handful of D3D11 methods used here.
+    static class D3D11Bandwidth
+    {
+        [DllImport("dxgi.dll")]
+        static extern int CreateDXGIFactory1(ref Guid riid, out IDXGIFactory1 factory);
+        [DllImport("d3d11.dll")]
+        static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software, uint flags, IntPtr levels, uint numLevels,
+            uint sdkVersion, out IntPtr device, out int level, out IntPtr context);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct BUFFER_DESC { public uint ByteWidth, Usage, BindFlags, CPUAccessFlags, MiscFlags, StructureByteStride; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct QUERY_DESC { public uint Query, MiscFlags; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct MAPPED { public IntPtr pData; public uint RowPitch, DepthPitch; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct DISJOINT { public ulong Frequency; public int Disjoint; }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateBufferFn(IntPtr self, ref BUFFER_DESC d, IntPtr init, out IntPtr buf);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateQueryFn(IntPtr self, ref QUERY_DESC d, out IntPtr q);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int MapFn(IntPtr self, IntPtr res, uint sub, int type, uint flags, out MAPPED m);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void UnmapFn(IntPtr self, IntPtr res, uint sub);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void AsyncFn(IntPtr self, IntPtr async);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int GetDataFn(IntPtr self, IntPtr async, IntPtr data, uint size, uint flags);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CopyFn(IntPtr self, IntPtr dst, IntPtr src);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void FlushFn(IntPtr self);
+
+        // ID3D11Device / ID3D11DeviceContext vtable slots
+        const int DEV_CreateBuffer = 3, DEV_CreateQuery = 24;
+        const int CTX_Map = 14, CTX_Unmap = 15, CTX_Begin = 27, CTX_End = 28, CTX_GetData = 29, CTX_CopyResource = 47, CTX_Flush = 111;
+
+        const uint BufferBytes = 64u << 20;     // 64 MB per copy
+
+        // Latest successful result per GPU instance id (the live monitor uses it as the link capacity).
+        public static Dictionary<string, BandwidthResult> LastResults = new Dictionary<string, BandwidthResult>();
+
+        static T Vt<T>(IntPtr obj, int slot) where T : class
+        {
+            IntPtr vtbl = Marshal.ReadIntPtr(obj);
+            return Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(vtbl, slot * IntPtr.Size), typeof(T)) as T;
+        }
+
+        class Ctx
+        {
+            public IntPtr Dev, Ctx_;
+            public CreateBufferFn CreateBuffer;
+            public CreateQueryFn CreateQuery;
+            public MapFn Map;
+            public UnmapFn Unmap;
+            public AsyncFn Begin, End;
+            public GetDataFn GetData;
+            public CopyFn Copy;
+            public FlushFn Flush;
+            public List<IntPtr> Owned = new List<IntPtr>();
+
+            public IntPtr Buffer(uint usage, uint bind, uint cpu)
+            {
+                var d = new BUFFER_DESC();
+                d.ByteWidth = BufferBytes; d.Usage = usage; d.BindFlags = bind; d.CPUAccessFlags = cpu;
+                IntPtr b;
+                int hr = CreateBuffer(Dev, ref d, IntPtr.Zero, out b);
+                if (hr != 0 || b == IntPtr.Zero) throw new Exception("CreateBuffer failed (0x" + hr.ToString("X8") + ")");
+                Owned.Add(b);
+                return b;
+            }
+
+            public IntPtr Query(uint type)
+            {
+                var d = new QUERY_DESC();
+                d.Query = type;
+                IntPtr q;
+                int hr = CreateQuery(Dev, ref d, out q);
+                if (hr != 0 || q == IntPtr.Zero) throw new Exception("CreateQuery failed (0x" + hr.ToString("X8") + ")");
+                Owned.Add(q);
+                return q;
+            }
+
+            // Spins until the query result is ready (S_OK). Returns false on timeout.
+            public bool Wait(IntPtr q, IntPtr data, uint size)
+            {
+                var sw = Stopwatch.StartNew();
+                while (true)
+                {
+                    int hr = GetData(Ctx_, q, data, size, 0);
+                    if (hr == 0) return true;
+                    if (hr < 0 || sw.ElapsedMilliseconds > 60000) return false;
+                    Thread.Sleep(0);
+                }
+            }
+
+            public void Idle(IntPtr evt)
+            {
+                End(Ctx_, evt);
+                Flush(Ctx_);
+                if (!Wait(evt, IntPtr.Zero, 0)) throw new Exception("GPU did not respond");
+            }
+        }
+
+        static IntPtr FindAdapter(uint ven, uint dev)
+        {
+            IDXGIFactory1 f;
+            Guid iid = typeof(IDXGIFactory1).GUID;
+            if (CreateDXGIFactory1(ref iid, out f) != 0 || f == null) return IntPtr.Zero;
+            try
+            {
+                for (uint i = 0; i < 16; i++)
+                {
+                    IDXGIAdapter1 a;
+                    if (f.EnumAdapters1(i, out a) != 0 || a == null) break;
+                    DXGI_ADAPTER_DESC1 d;
+                    bool match = a.GetDesc1(out d) == 0 && d.VendorId == ven && d.DeviceId == dev;
+                    IntPtr p = match ? Marshal.GetComInterfaceForObject(a, typeof(IDXGIAdapter1)) : IntPtr.Zero;
+                    Marshal.ReleaseComObject(a);
+                    if (match) return p;
+                }
+            }
+            finally { Marshal.ReleaseComObject(f); }
+            return IntPtr.Zero;
+        }
+
+        // Times reps copies (alternating between two destinations) with GPU timestamps. Returns GB/s.
+        static double Run(Ctx c, IntPtr[] dst, IntPtr[] src, int reps, IntPtr qDisjoint, IntPtr qStart, IntPtr qEnd, IntPtr evt)
+        {
+            c.Idle(evt);
+            var sw = Stopwatch.StartNew();
+            c.Begin(c.Ctx_, qDisjoint);
+            c.End(c.Ctx_, qStart);
+            for (int i = 0; i < reps; i++) c.Copy(c.Ctx_, dst[i % dst.Length], src[i % src.Length]);
+            c.End(c.Ctx_, qEnd);
+            c.End(c.Ctx_, qDisjoint);
+            c.Flush(c.Ctx_);
+
+            IntPtr buf = Marshal.AllocHGlobal(32);
+            try
+            {
+                if (!c.Wait(qDisjoint, buf, (uint)Marshal.SizeOf(typeof(DISJOINT)))) throw new Exception("GPU did not respond");
+                double wall = sw.Elapsed.TotalSeconds;
+                var dj = (DISJOINT)Marshal.PtrToStructure(buf, typeof(DISJOINT));
+                double seconds = wall;
+                if (dj.Disjoint == 0 && dj.Frequency > 0 && c.Wait(qStart, buf, 8))
+                {
+                    ulong t0 = (ulong)Marshal.ReadInt64(buf);
+                    if (c.Wait(qEnd, buf, 8))
+                    {
+                        ulong t1 = (ulong)Marshal.ReadInt64(buf);
+                        if (t1 > t0) seconds = (t1 - t0) / (double)dj.Frequency;
+                    }
+                }
+                return (double)BufferBytes * reps / seconds / 1e9;
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
+        // Calibrates the number of copies so one run takes about half a second, then keeps the best of 3 runs.
+        static double Measure(Ctx c, IntPtr[] dst, IntPtr[] src, IntPtr qd, IntPtr qs, IntPtr qe, IntPtr evt)
+        {
+            double rate = Run(c, dst, src, 2, qd, qs, qe, evt);
+            int reps = (int)Math.Ceiling(0.5 * rate * 1e9 / BufferBytes);
+            reps = Math.Max(4, Math.Min(256, reps));
+            double best = 0;
+            for (int i = 0; i < 3; i++) best = Math.Max(best, Run(c, dst, src, reps, qd, qs, qe, evt));
+            return best;
+        }
+
+        public static BandwidthResult Test(GpuInfo g, Action<string> progress)
+        {
+            var r = new BandwidthResult();
+            try { r.Chain = Pcie.Chain(g.InstanceId); } catch { }
+            r.Integrated = r.Chain.Count == 0 || r.Chain[0] == null;
+            try { r.Tunnel = Pcie.Tunnel(g.InstanceId); } catch { }
+
+            IntPtr adapter = FindAdapter(g.VenId, g.DevId);
+            if (adapter == IntPtr.Zero) { r.Error = "This GPU is not available to DirectX (is it enabled and is the driver installed?)."; return r; }
+
+            var c = new Ctx();
+            try
+            {
+                int level;
+                int hr = D3D11CreateDevice(adapter, 0, IntPtr.Zero, 0, IntPtr.Zero, 0, 7, out c.Dev, out level, out c.Ctx_);
+                if (hr != 0 || c.Dev == IntPtr.Zero) { r.Error = "Could not create a Direct3D 11 device (0x" + hr.ToString("X8") + ")."; return r; }
+
+                c.CreateBuffer = Vt<CreateBufferFn>(c.Dev, DEV_CreateBuffer);
+                c.CreateQuery = Vt<CreateQueryFn>(c.Dev, DEV_CreateQuery);
+                c.Map = Vt<MapFn>(c.Ctx_, CTX_Map);
+                c.Unmap = Vt<UnmapFn>(c.Ctx_, CTX_Unmap);
+                c.Begin = Vt<AsyncFn>(c.Ctx_, CTX_Begin);
+                c.End = Vt<AsyncFn>(c.Ctx_, CTX_End);
+                c.GetData = Vt<GetDataFn>(c.Ctx_, CTX_GetData);
+                c.Copy = Vt<CopyFn>(c.Ctx_, CTX_CopyResource);
+                c.Flush = Vt<FlushFn>(c.Ctx_, CTX_Flush);
+
+                progress("Allocating buffers...");
+                const uint DEFAULT = 0, STAGING = 3, BIND_VB = 0x1, CPU_WRITE = 0x10000, CPU_READ = 0x20000;
+                IntPtr up = c.Buffer(STAGING, 0, CPU_WRITE);                 // system memory, CPU writes
+                IntPtr[] vram = { c.Buffer(DEFAULT, BIND_VB, 0), c.Buffer(DEFAULT, BIND_VB, 0) };
+                IntPtr[] down = { c.Buffer(STAGING, 0, CPU_READ), c.Buffer(STAGING, 0, CPU_READ) };
+                IntPtr qd = c.Query(3), qs = c.Query(2), qe = c.Query(2), evt = c.Query(0);   // disjoint, timestamp x2, event
+
+                // Fill the upload buffer with non-trivial data.
+                MAPPED m;
+                hr = c.Map(c.Ctx_, up, 0, 2, 0, out m);   // D3D11_MAP_WRITE
+                if (hr != 0) throw new Exception("Map failed (0x" + hr.ToString("X8") + ")");
+                var chunk = new byte[1 << 20];
+                new Random(1).NextBytes(chunk);
+                for (long off = 0; off < BufferBytes; off += chunk.Length) Marshal.Copy(chunk, 0, new IntPtr(m.pData.ToInt64() + off), chunk.Length);
+                c.Unmap(c.Ctx_, up, 0);
+
+                // While traffic flows: re-read the link (GPUs lower its speed when idle) and, on NVIDIA,
+                // record the NVML counter peaks so the live monitor knows what "100 %" looks like.
+                int phase = 1;   // 1 = upload, 2 = download, 0 = done
+                IntPtr nv = IntPtr.Zero;
+                try { nv = Nvml.Find(g.VenId, g.DevId); } catch { }
+                var sampler = new Thread(delegate ()
+                {
+                    Thread.Sleep(150);
+                    try { r.ChainLoad = Pcie.Chain(g.InstanceId); } catch { }
+                    while (nv != IntPtr.Zero && phase != 0)
+                    {
+                        double rx, tx;
+                        try
+                        {
+                            if (!Nvml.Throughput(nv, out rx, out tx)) break;
+                            if (phase == 1) r.NvmlRxPeak = Math.Max(r.NvmlRxPeak, rx);
+                            else r.NvmlTxPeak = Math.Max(r.NvmlTxPeak, tx);
+                        }
+                        catch { break; }
+                        Thread.Sleep(30);
+                    }
+                });
+                sampler.IsBackground = true;
+                sampler.Start();
+                try
+                {
+                    progress("Measuring host -> GPU...");
+                    r.UploadGBs = Measure(c, vram, new IntPtr[] { up }, qd, qs, qe, evt);
+                    phase = 2;
+                    progress("Measuring GPU -> host...");
+                    r.DownloadGBs = Measure(c, down, new IntPtr[] { vram[0] }, qd, qs, qe, evt);
+                }
+                finally { phase = 0; sampler.Join(2000); }
+            }
+            catch (Exception ex) { r.Error = ex.Message; }
+            finally
+            {
+                foreach (var p in c.Owned) Marshal.Release(p);
+                if (c.Ctx_ != IntPtr.Zero) Marshal.Release(c.Ctx_);
+                if (c.Dev != IntPtr.Zero) Marshal.Release(c.Dev);
+                Marshal.Release(adapter);
+            }
+            return r;
+        }
+    }
+
+    // ------------------------------------------------------------------ Live PCIe monitor (NVML samples while apps / games run)
+
+    class PcieSample
+    {
+        public DateTime Time;
+        public double Rx, Tx;          // bytes/s: rx = host -> GPU, tx = GPU -> host (NVML counters)
+        public double Dt;              // seconds since the previous sample
+        public string Link, App;
+        public bool Saturated;
+    }
+
+    class PcieEpisode
+    {
+        public DateTime Start, End;
+        public double PeakPct;
+        public string Dir;             // "Host -> GPU", "GPU -> Host" or "Both"
+        public string App;
+        public double Seconds { get { return (End - Start).TotalSeconds; } }
+    }
+
+    class PcieMonitor
+    {
+        public const int IntervalMs = 250;
+        public const int MaxSamples = 4 * 3600 * 24;   // 24 h at 4 samples/s
+        public const double MinEpisodeSeconds = 0.5;
+
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+
+        public readonly object Lock = new object();
+        public readonly List<PcieSample> Samples = new List<PcieSample>();
+        public readonly List<PcieEpisode> Episodes = new List<PcieEpisode>();
+        public double CapRx, CapTx;            // bytes/s that count as 100 %
+        public string CapSource = "";
+        public double ThresholdPct = 80;
+        public GpuInfo Gpu;
+        public string Error;
+
+        // Running totals (under Lock)
+        public double Seconds, SumRx, SumTx, SatSeconds, MaxRx, MaxTx;
+        public DateTime MaxRxTime, MaxTxTime, Started;
+        PcieEpisode open;
+        int belowCount;
+
+        IntPtr handle;
+        Thread thread;
+        volatile bool running;
+        DateTime lastTime;
+        uint lastPid;
+        string lastApp = "";
+
+        public bool Running { get { return running; } }
+
+        public bool Attach(GpuInfo g)
+        {
+            Stop();
+            Gpu = g;
+            Error = null;
+            handle = IntPtr.Zero;
+            if (g == null) { Error = "No GPU selected."; return false; }
+            if (g.VenId != 0x10DE)
+            {
+                Error = "Live PCIe traffic needs an NVIDIA GPU. AMD and Intel drivers do not expose PCIe traffic counters to apps. " +
+                    "You can still use PCIe bandwidth... on the GPUs page to measure the link limit.";
+                return false;
+            }
+            try { handle = Nvml.Find(g.VenId, g.DevId); } catch { handle = IntPtr.Zero; }
+            if (handle == IntPtr.Zero) { Error = "NVML (nvml.dll from the NVIDIA driver) could not open this GPU."; return false; }
+            double rx, tx;
+            if (!Nvml.Throughput(handle, out rx, out tx)) { Error = "This GPU / driver does not report PCIe throughput through NVML."; handle = IntPtr.Zero; return false; }
+            UpdateCapacity();
+            return true;
+        }
+
+        // 100 % = NVML peaks from the last bandwidth test, otherwise the theoretical link bandwidth.
+        public void UpdateCapacity()
+        {
+            if (Gpu == null) return;
+            BandwidthResult r;
+            if (D3D11Bandwidth.LastResults.TryGetValue(Gpu.InstanceId, out r) && r.NvmlRxPeak > 0 && r.NvmlTxPeak > 0)
+            {
+                CapRx = r.NvmlRxPeak; CapTx = r.NvmlTxPeak;
+                CapSource = "measured by the bandwidth test";
+                return;
+            }
+            // Theoretical bandwidth of the current link. GPUs downclock the link when idle, so the
+            // sampling loop raises this as soon as it sees a faster link under load.
+            CapRx = CapTx = 0;
+            try
+            {
+                var chain = Pcie.Chain(Gpu.InstanceId);
+                if (chain.Count > 0 && chain[0] != null) CapRx = CapTx = chain[0].CurGBs * 1e9;
+            }
+            catch { }
+            if (CapRx <= 0) CapRx = CapTx = 1e9;
+            CapSource = "theoretical link";
+        }
+
+        bool Measured { get { return CapSource.StartsWith("measured", StringComparison.Ordinal); } }
+
+        public void Start()
+        {
+            if (running || handle == IntPtr.Zero) return;
+            running = true;
+            lastTime = DateTime.MinValue;
+            lock (Lock) { if (Samples.Count == 0) Started = DateTime.Now; }
+            thread = new Thread(Loop);
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        public void Stop()
+        {
+            running = false;
+            if (thread != null) { thread.Join(1000); thread = null; }
+            lock (Lock) CloseEpisode();
+        }
+
+        public void Reset()
+        {
+            lock (Lock)
+            {
+                Samples.Clear(); Episodes.Clear();
+                Seconds = SumRx = SumTx = SatSeconds = MaxRx = MaxTx = 0;
+                open = null; belowCount = 0;
+                Started = DateTime.Now;
+                lastTime = DateTime.MinValue;
+            }
+        }
+
+        string ForegroundApp()
+        {
+            try
+            {
+                uint pid;
+                GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+                if (pid == lastPid) return lastApp;
+                lastPid = pid;
+                using (var p = Process.GetProcessById((int)pid)) lastApp = p.ProcessName;
+            }
+            catch { lastApp = "?"; }
+            return lastApp;
+        }
+
+        void Loop()
+        {
+            int linkTick = 0;
+            string link = Txt.NA;
+            while (running)
+            {
+                var t0 = DateTime.Now;
+                double rx, tx;
+                bool ok;
+                try { ok = Nvml.Throughput(handle, out rx, out tx); } catch { ok = false; rx = tx = 0; }
+                if (!ok) { Error = "Lost the GPU (was it disabled or unplugged?)."; running = false; break; }
+                if (linkTick-- <= 0)
+                {
+                    int gen = 0, width = 0;
+                    try { link = Nvml.Link(handle, out gen, out width); } catch { }
+                    double theo = PcieLink.LaneGBs(gen) * width * 1e9;
+                    if (!Measured && theo > CapRx) CapRx = CapTx = theo;
+                    linkTick = 4;
+                }
+                Add(rx, tx, link, ForegroundApp());
+                int wait = IntervalMs - (int)(DateTime.Now - t0).TotalMilliseconds;
+                if (wait > 0) Thread.Sleep(wait);
+            }
+        }
+
+        void Add(double rx, double tx, string link, string app)
+        {
+            var now = DateTime.Now;
+            var s = new PcieSample();
+            s.Time = now; s.Rx = rx; s.Tx = tx; s.Link = link; s.App = app;
+            s.Dt = lastTime == DateTime.MinValue ? IntervalMs / 1000.0 : Math.Min(2.0, (now - lastTime).TotalSeconds);
+            lastTime = now;
+            double pr = CapRx > 0 ? rx / CapRx * 100 : 0, pt = CapTx > 0 ? tx / CapTx * 100 : 0;
+            s.Saturated = pr >= ThresholdPct || pt >= ThresholdPct;
+
+            lock (Lock)
+            {
+                if (Samples.Count >= MaxSamples) Samples.RemoveRange(0, MaxSamples / 10);
+                Samples.Add(s);
+                Seconds += s.Dt; SumRx += rx * s.Dt; SumTx += tx * s.Dt;
+                if (rx > MaxRx) { MaxRx = rx; MaxRxTime = now; }
+                if (tx > MaxTx) { MaxTx = tx; MaxTxTime = now; }
+                if (s.Saturated)
+                {
+                    SatSeconds += s.Dt;
+                    belowCount = 0;
+                    string dir = pr >= ThresholdPct && pt >= ThresholdPct ? "Both" : (pr >= ThresholdPct ? "Host -> GPU" : "GPU -> Host");
+                    if (open == null)
+                    {
+                        open = new PcieEpisode();
+                        open.Start = now.AddSeconds(-s.Dt);
+                        open.Dir = dir;
+                        open.App = app;
+                    }
+                    else if (open.Dir != dir) open.Dir = "Both";
+                    open.End = now;
+                    open.PeakPct = Math.Max(open.PeakPct, Math.Max(pr, pt));
+                }
+                else if (open != null && ++belowCount >= 2) CloseEpisode();   // 2 quiet samples end an episode
+            }
+        }
+
+        void CloseEpisode()
+        {
+            if (open != null && open.Seconds >= MinEpisodeSeconds) Episodes.Add(open);
+            open = null;
+            belowCount = 0;
+        }
+
+        public PcieEpisode OpenEpisode { get { return open; } }
+
+        public void ExportCsv(string path)
+        {
+            var sb = new StringBuilder();
+            lock (Lock)
+            {
+                sb.Append("# GPU," + Csv(Gpu != null ? Gpu.Name : "") + Txt.NL);
+                sb.Append("# 100 % = host->GPU " + (CapRx / 1e9).ToString("0.00", Txt.Inv) + " GB/s; GPU->host " + (CapTx / 1e9).ToString("0.00", Txt.Inv) + " GB/s (" + CapSource + ")" + Txt.NL);
+                sb.Append("# Threshold," + ThresholdPct.ToString("0", Txt.Inv) + " %" + Txt.NL);
+                if (Seconds > 0)
+                    sb.Append("# Average GB/s,host->GPU " + (SumRx / Seconds / 1e9).ToString("0.000", Txt.Inv) + ",GPU->host " + (SumTx / Seconds / 1e9).ToString("0.000", Txt.Inv) + Txt.NL);
+                sb.Append("# Peak GB/s,host->GPU " + (MaxRx / 1e9).ToString("0.000", Txt.Inv) + ",GPU->host " + (MaxTx / 1e9).ToString("0.000", Txt.Inv) + Txt.NL);
+                sb.Append("# Bottleneck seconds," + SatSeconds.ToString("0.0", Txt.Inv) + Txt.NL + Txt.NL);
+
+                sb.Append("episode_start,episode_end,seconds,direction,peak_pct,app" + Txt.NL);
+                foreach (var e in Episodes)
+                    sb.Append(e.Start.ToString("yyyy-MM-dd HH:mm:ss.fff", Txt.Inv) + "," + e.End.ToString("yyyy-MM-dd HH:mm:ss.fff", Txt.Inv) + "," +
+                        e.Seconds.ToString("0.00", Txt.Inv) + "," + Csv(e.Dir) + "," + e.PeakPct.ToString("0", Txt.Inv) + "," + Csv(e.App) + Txt.NL);
+                sb.Append(Txt.NL);
+
+                sb.Append("time,host_to_gpu_GBps,gpu_to_host_GBps,host_to_gpu_pct,gpu_to_host_pct,link,foreground_app,bottleneck" + Txt.NL);
+                foreach (var s in Samples)
+                    sb.Append(s.Time.ToString("yyyy-MM-dd HH:mm:ss.fff", Txt.Inv) + "," +
+                        (s.Rx / 1e9).ToString("0.000", Txt.Inv) + "," + (s.Tx / 1e9).ToString("0.000", Txt.Inv) + "," +
+                        (CapRx > 0 ? s.Rx / CapRx * 100 : 0).ToString("0.0", Txt.Inv) + "," + (CapTx > 0 ? s.Tx / CapTx * 100 : 0).ToString("0.0", Txt.Inv) + "," +
+                        Csv(s.Link) + "," + Csv(s.App) + "," + (s.Saturated ? "1" : "0") + Txt.NL);
+            }
+            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
+        }
+
+        static string Csv(string v)
+        {
+            if (v == null) return "";
+            if (v.IndexOf(',') < 0 && v.IndexOf('"') < 0) return v;
+            return Txt.Q + v.Replace(Txt.Q, Txt.Q + Txt.Q) + Txt.Q;
+        }
+    }
+
     // ------------------------------------------------------------------ Stats collection
 
     class GpuStats
@@ -1009,6 +1729,154 @@ namespace GpuToggle
         }
     }
 
+    // Real-time line graph of the last N seconds of PCIe traffic, as % of the link capacity.
+    class PcieGraph : Control
+    {
+        public PcieMonitor Mon;
+        public int WindowSeconds = 120;
+        public string Message;
+        static readonly Color RxColor = Color.FromArgb(37, 99, 235);
+        static readonly Color TxColor = Color.FromArgb(234, 88, 12);
+
+        public PcieGraph()
+        {
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.ResizeRedraw | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
+            BackColor = Theme.Card;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Theme.Card);
+            var tf = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+            if (Message != null || Mon == null)
+            {
+                TextRenderer.DrawText(g, Message ?? "", Theme.Regular, new Rectangle(Ui.S(20), 0, Width - Ui.S(40), Height), Theme.Muted,
+                    TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
+                return;
+            }
+
+            var plot = new Rectangle(Ui.S(48), Ui.S(30), Width - Ui.S(64), Height - Ui.S(56));
+            if (plot.Width < 40 || plot.Height < 30) return;
+
+            List<PcieSample> pts = new List<PcieSample>();
+            double capRx, capTx, thr;
+            lock (Mon.Lock)
+            {
+                capRx = Mon.CapRx; capTx = Mon.CapTx; thr = Mon.ThresholdPct;
+                DateTime from = DateTime.Now.AddSeconds(-WindowSeconds - 1);
+                for (int i = Mon.Samples.Count - 1; i >= 0 && Mon.Samples[i].Time >= from; i--) pts.Add(Mon.Samples[i]);
+            }
+            pts.Reverse();
+
+            double top = 100;
+            foreach (var p in pts) top = Math.Max(top, Math.Max(Pct(p.Rx, capRx), Pct(p.Tx, capTx)));
+            top = Math.Ceiling(top / 25) * 25;
+
+            // Bottleneck shading
+            DateTime now = DateTime.Now;
+            using (var sat = new SolidBrush(Color.FromArgb(40, 220, 38, 38)))
+                foreach (var p in pts)
+                {
+                    if (!p.Saturated) continue;
+                    float x1 = X(plot, now, p.Time.AddSeconds(-p.Dt)), x2 = X(plot, now, p.Time);
+                    g.FillRectangle(sat, x1, plot.Top, Math.Max(1f, x2 - x1), plot.Height);
+                }
+
+            // Grid + axis labels
+            using (var grid = new Pen(Theme.Border))
+                for (int v = 0; v <= top; v += 25)
+                {
+                    float y = Y(plot, v, top);
+                    g.DrawLine(grid, plot.Left, y, plot.Right, y);
+                    TextRenderer.DrawText(g, v + " %", Theme.Small, new Rectangle(0, (int)y - Ui.S(8), plot.Left - Ui.S(6), Ui.S(16)), Theme.Muted,
+                        TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                }
+            for (int sec = 0; sec <= WindowSeconds; sec += 30)
+            {
+                float x = plot.Right - (float)sec / WindowSeconds * plot.Width;
+                TextRenderer.DrawText(g, sec == 0 ? "now" : "-" + sec + " s", Theme.Small, new Point((int)x - Ui.S(14), plot.Bottom + Ui.S(6)), Theme.Muted, tf);
+            }
+            using (var th = new Pen(Theme.Red, 1f))
+            {
+                th.DashStyle = DashStyle.Dash;
+                float y = Y(plot, thr, top);
+                g.DrawLine(th, plot.Left, y, plot.Right, y);
+                TextRenderer.DrawText(g, "bottleneck " + thr.ToString("0", Txt.Inv) + " %", Theme.Small, new Point(plot.Left + Ui.S(4), (int)y - Ui.S(16)), Theme.Red, tf);
+            }
+
+            // Lines
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            DrawLine(g, plot, now, top, pts, capRx, true, RxColor);
+            DrawLine(g, plot, now, top, pts, capTx, false, TxColor);
+            g.SmoothingMode = SmoothingMode.Default;
+
+            // Legend
+            int lx = plot.Left;
+            lx = Legend(g, lx, "Host -> GPU (upload)", RxColor, tf);
+            Legend(g, lx + Ui.S(18), "GPU -> Host (download)", TxColor, tf);
+        }
+
+        int Legend(Graphics g, int x, string text, Color c, TextFormatFlags tf)
+        {
+            using (var b = new SolidBrush(c)) g.FillRectangle(b, x, Ui.S(10), Ui.S(14), Ui.S(4));
+            TextRenderer.DrawText(g, text, Theme.Small, new Point(x + Ui.S(20), Ui.S(4)), Theme.Text, tf);
+            return x + Ui.S(20) + TextRenderer.MeasureText(text, Theme.Small).Width;
+        }
+
+        void DrawLine(Graphics g, Rectangle plot, DateTime now, double top, List<PcieSample> pts, double cap, bool rx, Color c)
+        {
+            if (pts.Count < 2) return;
+            var arr = new PointF[pts.Count];
+            for (int i = 0; i < pts.Count; i++)
+                arr[i] = new PointF(X(plot, now, pts[i].Time), Y(plot, Pct(rx ? pts[i].Rx : pts[i].Tx, cap), top));
+            using (var pen = new Pen(c, Ui.S(2))) g.DrawLines(pen, arr);
+        }
+
+        static double Pct(double v, double cap) { return cap > 0 ? v / cap * 100 : 0; }
+        float X(Rectangle plot, DateTime now, DateTime t)
+        {
+            double age = (now - t).TotalSeconds;
+            return (float)Math.Max(plot.Left, plot.Right - age / WindowSeconds * plot.Width);
+        }
+        static float Y(Rectangle plot, double pct, double top) { return (float)(plot.Bottom - Math.Min(pct, top) / top * plot.Height); }
+    }
+
+    // Small white card with a caption, a big value and a muted detail line.
+    class StatCard : Control
+    {
+        public string Caption = "", Value = Txt.NA, Detail = "";
+        public Color ValueColor = Theme.Text;
+
+        public StatCard()
+        {
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.ResizeRedraw | ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint, true);
+            Margin = new Padding(0, 0, Ui.S(10), 0);
+        }
+
+        public void Set(string value, string detail, Color color)
+        {
+            if (value == Value && detail == Detail && color == ValueColor) return;
+            Value = value; Detail = detail; ValueColor = color;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Theme.Card);
+            using (var pen = new Pen(Theme.Border)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+            var tf = TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+            int x = Ui.S(12), w = Width - Ui.S(20);
+            TextRenderer.DrawText(g, Caption.ToUpperInvariant(), Theme.SmallBold, new Rectangle(x, Ui.S(8), w, Ui.S(18)), Theme.Muted, tf);
+            TextRenderer.DrawText(g, Value, Theme.Title, new Rectangle(x, Ui.S(26), w, Ui.S(30)), ValueColor, tf);
+            TextRenderer.DrawText(g, Detail, Theme.Small, new Rectangle(x, Ui.S(58), w, Height - Ui.S(60)), Theme.Muted,
+                TextFormatFlags.Left | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+        }
+    }
+
     class MainForm : Form
     {
         const int RevertSeconds = 15;
@@ -1019,10 +1887,22 @@ namespace GpuToggle
         const int A_PREF = 1, A_RUN = 2;
 
         StyledList list, dispList, appsList;
-        Button btnEnable, btnDisable, btnRefresh;
+        Button btnEnable, btnDisable, btnRefresh, btnPcie;
         Button btnAddApp, btnAddRunning, btnRemoveApp, btnLaunch, btnGfxSettings, btnPrefAuto, btnPrefSave, btnPrefPerf;
-        Button navGpus, navApps;
-        Panel gpuPage, appsPage, header;
+        Button navGpus, navApps, navMon;
+        Panel gpuPage, appsPage, monitorPage, header;
+        // PCIe monitor page
+        PcieMonitor mon = new PcieMonitor();
+        PcieGraph graph;
+        StatCard cardNow, cardAvg, cardPeak, cardSat;
+        StyledList epList;
+        ComboBox cmbMonGpu;
+        NumericUpDown numThr;
+        Button btnMonStart, btnMonReset, btnMonMeasure, btnMonExport;
+        Label lblMonInfo;
+        List<GpuInfo> monGpus = new List<GpuInfo>();
+        int shownEpisodes;
+        System.Windows.Forms.Timer monTimer;
         CheckBox chkAll;
         Label lblStatus, lblPrefInfo;
         System.Windows.Forms.Timer debounce, statsTimer;
@@ -1038,7 +1918,7 @@ namespace GpuToggle
             Font = Theme.Regular;
             BackColor = Theme.Surface;
             ClientSize = new Size(Ui.S(1120), Ui.S(680));
-            MinimumSize = new Size(Ui.S(820), Ui.S(520));
+            MinimumSize = new Size(Ui.S(960), Ui.S(560));
             StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             logo = LoadLogo(Ui.S(40));
@@ -1046,6 +1926,7 @@ namespace GpuToggle
             BuildHeader();
             BuildGpuPage();
             BuildAppsPage();
+            BuildMonitorPage();
 
             var content = new Panel();
             content.Dock = DockStyle.Fill;
@@ -1053,6 +1934,7 @@ namespace GpuToggle
             content.Padding = new Padding(Ui.S(16), Ui.S(14), Ui.S(16), Ui.S(10));
             content.Controls.Add(gpuPage);
             content.Controls.Add(appsPage);
+            content.Controls.Add(monitorPage);
 
             var statusBar = new Panel();
             statusBar.Dock = DockStyle.Bottom;
@@ -1097,7 +1979,12 @@ namespace GpuToggle
                 UpdateStats();
                 statsTimer.Start();
             };
-            FormClosing += delegate { statsTimer.Stop(); };
+            monTimer = new System.Windows.Forms.Timer();
+            monTimer.Interval = 500;
+            monTimer.Tick += delegate { UpdateMonitorUi(); };
+            monTimer.Start();
+
+            FormClosing += delegate { statsTimer.Stop(); monTimer.Stop(); mon.Stop(); };
         }
 
         // Reads the largest frame of the embedded app.ico. PNG frames are decoded directly,
@@ -1178,10 +2065,13 @@ namespace GpuToggle
             nav.Padding = new Padding(0, Ui.S(18), Ui.S(14), 0);
             navGpus = MakeNav("GPUs");
             navApps = MakeNav("Apps / Games");
+            navMon = MakeNav("PCIe monitor");
             navGpus.Click += delegate { ShowPage(0); };
             navApps.Click += delegate { ShowPage(1); };
+            navMon.Click += delegate { ShowPage(2); };
             nav.Controls.Add(navGpus);
             nav.Controls.Add(navApps);
+            nav.Controls.Add(navMon);
             header.Controls.Add(nav);
         }
 
@@ -1207,11 +2097,15 @@ namespace GpuToggle
         {
             gpuPage.Visible = page == 0;
             appsPage.Visible = page == 1;
-            navGpus.BackColor = page == 0 ? Theme.HeaderSel : Theme.Header;
-            navGpus.ForeColor = page == 0 ? Color.White : Theme.HeaderMuted;
-            navApps.BackColor = page == 1 ? Theme.HeaderSel : Theme.Header;
-            navApps.ForeColor = page == 1 ? Color.White : Theme.HeaderMuted;
+            monitorPage.Visible = page == 2;
+            Button[] navs = { navGpus, navApps, navMon };
+            for (int i = 0; i < navs.Length; i++)
+            {
+                navs[i].BackColor = page == i ? Theme.HeaderSel : Theme.Header;
+                navs[i].ForeColor = page == i ? Color.White : Theme.HeaderMuted;
+            }
             if (page == 1) RefreshApps();
+            else if (page == 2) SetStatus("Start recording, then play your game. NVIDIA GPUs only (NVML). Shaded areas = PCIe bottleneck.");
             else SetStatus(list.Items.Count + " GPU(s) found. Double-click a row to toggle. Stats refresh every 2 s.");
         }
 
@@ -1228,6 +2122,8 @@ namespace GpuToggle
             btnRefresh.Click += delegate { RefreshList(); };
             btnDisable.Click += delegate { DisableSelected(); };
             btnEnable.Click += delegate { EnableSelected(); };
+            btnPcie = Theme.MakeButton("PCIe bandwidth...", Theme.Card, false);
+            btnPcie.Click += delegate { TestBandwidth(); };
 
             chkAll = new CheckBox();
             chkAll.Text = "Show virtual adapters";
@@ -1239,6 +2135,7 @@ namespace GpuToggle
             bar.Controls.Add(btnEnable);
             bar.Controls.Add(btnDisable);
             bar.Controls.Add(btnRefresh);
+            bar.Controls.Add(btnPcie);
             bar.Controls.Add(chkAll);
 
             list = new StyledList();
@@ -1378,6 +2275,290 @@ namespace GpuToggle
             appsPage.Controls.Add(info);
         }
 
+        void BuildMonitorPage()
+        {
+            monitorPage = new Panel();
+            monitorPage.Dock = DockStyle.Fill;
+            monitorPage.BackColor = Theme.Surface;
+            monitorPage.Visible = false;
+
+            var bar = Theme.Toolbar();
+            var lblGpu = new Label();
+            lblGpu.Text = "GPU:";
+            lblGpu.AutoSize = true;
+            lblGpu.ForeColor = Theme.Muted;
+            lblGpu.Font = Theme.Semibold;
+            lblGpu.Margin = new Padding(0, Ui.S(8), Ui.S(6), 0);
+            cmbMonGpu = new ComboBox();
+            cmbMonGpu.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbMonGpu.Width = Ui.S(250);
+            cmbMonGpu.Margin = new Padding(0, Ui.S(5), Ui.S(10), 0);
+            cmbMonGpu.SelectedIndexChanged += delegate { AttachMonitor(); };
+
+            btnMonStart = Theme.MakeButton("Start recording", Theme.Green, true);
+            btnMonReset = Theme.MakeButton("Reset", Theme.Card, false);
+            btnMonMeasure = Theme.MakeButton("Measure limit...", Theme.Card, false);
+            btnMonExport = Theme.MakeButton("Export CSV...", Theme.Card, false);
+            btnMonStart.Click += delegate { ToggleMonitor(); };
+            btnMonReset.Click += delegate
+            {
+                mon.Reset();
+                shownEpisodes = 0;
+                epList.Items.Clear();
+                UpdateMonitorUi();
+            };
+            btnMonMeasure.Click += delegate { if (mon.Gpu != null) RunBandwidthTest(mon.Gpu); };
+            btnMonExport.Click += delegate { ExportMonitor(); };
+
+            var lblThr = new Label();
+            lblThr.Text = "Bottleneck at";
+            lblThr.AutoSize = true;
+            lblThr.ForeColor = Theme.Muted;
+            lblThr.Margin = new Padding(Ui.S(8), Ui.S(8), Ui.S(6), 0);
+            numThr = new NumericUpDown();
+            numThr.Minimum = 30; numThr.Maximum = 100; numThr.Value = 80; numThr.Increment = 5;
+            numThr.Width = Ui.S(56);
+            numThr.Margin = new Padding(0, Ui.S(5), Ui.S(4), 0);
+            numThr.ValueChanged += delegate { mon.ThresholdPct = (double)numThr.Value; graph.Invalidate(); };
+            var lblPct = new Label();
+            lblPct.Text = "% of link";
+            lblPct.AutoSize = true;
+            lblPct.ForeColor = Theme.Muted;
+            lblPct.Margin = new Padding(0, Ui.S(8), 0, 0);
+
+            bar.Controls.Add(lblGpu);
+            bar.Controls.Add(cmbMonGpu);
+            bar.Controls.Add(btnMonStart);
+            bar.Controls.Add(btnMonReset);
+            bar.Controls.Add(btnMonMeasure);
+            bar.Controls.Add(btnMonExport);
+            bar.Controls.Add(lblThr);
+            bar.Controls.Add(numThr);
+            bar.Controls.Add(lblPct);
+
+            lblMonInfo = new Label();
+            lblMonInfo.Dock = DockStyle.Top;
+            lblMonInfo.Height = Ui.S(24);
+            lblMonInfo.ForeColor = Theme.Muted;
+            lblMonInfo.Font = Theme.Small;
+            lblMonInfo.AutoEllipsis = true;
+
+            var cards = new TableLayoutPanel();
+            cards.Dock = DockStyle.Top;
+            cards.Height = Ui.S(100);
+            cards.ColumnCount = 4;
+            cards.RowCount = 1;
+            cards.BackColor = Theme.Surface;
+            for (int i = 0; i < 4; i++) cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
+            cardNow = new StatCard(); cardNow.Caption = "Now";
+            cardAvg = new StatCard(); cardAvg.Caption = "Average";
+            cardPeak = new StatCard(); cardPeak.Caption = "Peak";
+            cardSat = new StatCard(); cardSat.Caption = "Bottleneck time";
+            StatCard[] all = { cardNow, cardAvg, cardPeak, cardSat };
+            for (int i = 0; i < 4; i++)
+            {
+                all[i].Dock = DockStyle.Fill;
+                all[i].Margin = new Padding(i == 0 ? 0 : Ui.S(5), 0, i == 3 ? 0 : Ui.S(5), 0);
+                cards.Controls.Add(all[i], i, 0);
+            }
+
+            var gap = new Panel();
+            gap.Dock = DockStyle.Top;
+            gap.Height = Ui.S(10);
+            gap.BackColor = Theme.Surface;
+
+            graph = new PcieGraph();
+            graph.Mon = mon;
+
+            epList = new StyledList();
+            epList.Columns.Add("Start", Ui.S(110));
+            epList.Columns.Add("Duration", Ui.S(90));
+            epList.Columns.Add("Direction", Ui.S(130));
+            epList.Columns.Add("Peak", Ui.S(80));
+            epList.Columns.Add("App in foreground", Ui.S(240));
+
+            var split = new SplitContainer();
+            split.Dock = DockStyle.Fill;
+            split.Orientation = Orientation.Horizontal;
+            split.BackColor = Theme.Surface;
+            split.SplitterWidth = Ui.S(14);
+            split.Panel1.Controls.Add(Theme.Section("Live PCIe traffic", "Last 2 minutes, % of the link limit. Red areas = bottleneck.", Theme.CardAround(graph)));
+            split.Panel2.Controls.Add(Theme.Section("Bottleneck log", "Every stretch of at least " +
+                PcieMonitor.MinEpisodeSeconds.ToString("0.0", Txt.Inv) + " s above the threshold, newest first", Theme.CardAround(epList)));
+            monitorPage.Resize += delegate
+            {
+                if (split.Height > Ui.S(200)) split.SplitterDistance = (int)(split.Height * 0.62);
+            };
+
+            monitorPage.Controls.Add(split);
+            monitorPage.Controls.Add(gap);
+            monitorPage.Controls.Add(cards);
+            monitorPage.Controls.Add(lblMonInfo);
+            monitorPage.Controls.Add(bar);
+        }
+
+        // Keeps the GPU combo in sync with the GPU list; NVIDIA GPUs first.
+        void RefreshMonGpus()
+        {
+            if (cmbMonGpu == null) return;
+            string keep = mon.Gpu != null ? mon.Gpu.InstanceId : null;
+            var l = new List<GpuInfo>();
+            foreach (var g in gpus) if (g.IsPhysical && g.Enabled && g.VenId == 0x10DE) l.Add(g);
+            foreach (var g in gpus) if (g.IsPhysical && g.Enabled && g.VenId != 0x10DE) l.Add(g);
+            var ids = new StringBuilder();
+            foreach (var g in l) ids.Append(g.InstanceId).Append('|');
+            var old = new StringBuilder();
+            foreach (var g in monGpus) old.Append(g.InstanceId).Append('|');
+            if (ids.ToString() == old.ToString()) return;
+
+            monGpus = l;
+            cmbMonGpu.Items.Clear();
+            int sel = -1;
+            for (int i = 0; i < l.Count; i++)
+            {
+                cmbMonGpu.Items.Add(l[i].Name);
+                if (l[i].InstanceId == keep) sel = i;
+            }
+            if (sel < 0 && l.Count > 0) sel = 0;
+            if (sel >= 0) cmbMonGpu.SelectedIndex = sel;   // fires AttachMonitor
+            else AttachMonitor();
+        }
+
+        void AttachMonitor()
+        {
+            int i = cmbMonGpu.SelectedIndex;
+            GpuInfo g = i >= 0 && i < monGpus.Count ? monGpus[i] : null;
+            if (g != null && mon.Gpu != null && g.InstanceId == mon.Gpu.InstanceId && mon.Error == null) return;
+            bool wasRunning = mon.Running;
+            mon.Reset();
+            shownEpisodes = 0;
+            epList.Items.Clear();
+            bool ok = mon.Attach(g);
+            if (ok && wasRunning) mon.Start();
+            UpdateMonitorUi();
+        }
+
+        void ToggleMonitor()
+        {
+            if (mon.Running) mon.Stop();
+            else
+            {
+                if (mon.Gpu == null || mon.Error != null) AttachMonitor();
+                if (mon.Error == null) mon.Start();
+            }
+            UpdateMonitorUi();
+        }
+
+        // Pauses recording while the bandwidth test runs (it would show up as a bottleneck).
+        void RunBandwidthTest(GpuInfo g)
+        {
+            bool resume = mon.Running;
+            if (resume) mon.Stop();
+            using (var dlg = new BandwidthDialog(g)) dlg.ShowDialog(this);
+            if (mon.Gpu != null && mon.Gpu.InstanceId == g.InstanceId) mon.UpdateCapacity();
+            if (resume) mon.Start();
+            UpdateMonitorUi();
+        }
+
+        static string Gbs(double bytesPerSec) { return (bytesPerSec / 1e9).ToString("0.00", Txt.Inv); }
+        static string Pct(double v, double cap) { return (cap > 0 ? v / cap * 100 : 0).ToString("0", Txt.Inv) + " %"; }
+        static string Dur(double seconds)
+        {
+            var t = TimeSpan.FromSeconds(seconds);
+            return t.TotalHours >= 1 ? ((int)t.TotalHours) + ":" + t.ToString("mm':'ss", Txt.Inv) : t.ToString("mm':'ss", Txt.Inv);
+        }
+
+        void UpdateMonitorUi()
+        {
+            if (monitorPage == null || IsDisposed) return;
+            bool ok = mon.Error == null && mon.Gpu != null;
+            graph.Message = mon.Gpu == null ? "No enabled GPU found." : mon.Error;
+            btnMonStart.Text = mon.Running ? "Stop recording" : "Start recording";
+            btnMonStart.BackColor = mon.Running ? Theme.Red : Theme.Green;
+            btnMonStart.Enabled = ok;
+            btnMonMeasure.Enabled = mon.Gpu != null;
+
+            PcieSample last = null;
+            double secs, sumRx, sumTx, maxRx, maxTx, sat, capRx, capTx;
+            DateTime maxRxT, maxTxT, started;
+            int epCount;
+            var newEps = new List<PcieEpisode>();
+            bool inEpisode;
+            lock (mon.Lock)
+            {
+                if (mon.Samples.Count > 0) last = mon.Samples[mon.Samples.Count - 1];
+                secs = mon.Seconds; sumRx = mon.SumRx; sumTx = mon.SumTx; maxRx = mon.MaxRx; maxTx = mon.MaxTx; sat = mon.SatSeconds;
+                capRx = mon.CapRx; capTx = mon.CapTx; maxRxT = mon.MaxRxTime; maxTxT = mon.MaxTxTime; started = mon.Started;
+                epCount = mon.Episodes.Count;
+                for (int i = shownEpisodes; i < mon.Episodes.Count; i++) newEps.Add(mon.Episodes[i]);
+                shownEpisodes = mon.Episodes.Count;
+                inEpisode = mon.OpenEpisode != null;
+            }
+            btnMonExport.Enabled = secs > 0;
+            btnMonReset.Enabled = secs > 0;
+
+            if (ok)
+            {
+                lblMonInfo.Text = (mon.Running ? "Recording" : (secs > 0 ? "Paused" : "Not recording")) +
+                    (secs > 0 ? "  " + Dur(secs) + " (since " + started.ToString("HH:mm:ss", Txt.Inv) + ")" : "") +
+                    "   |   Link " + (last != null ? last.Link : Txt.NA) +
+                    "   |   100 % = " + Gbs(capRx) + " up / " + Gbs(capTx) + " down GB/s, " + mon.CapSource +
+                    "   |   NVML counts raw link traffic incl. protocol overhead";
+            }
+            else lblMonInfo.Text = "";
+
+            if (last != null && mon.Running)
+                cardNow.Set(Gbs(last.Rx) + " / " + Gbs(last.Tx), "GB/s up / down  -  " + Pct(last.Rx, capRx) + " / " + Pct(last.Tx, capTx) + " of link" +
+                    Txt.NL + "App: " + last.App, last.Saturated ? Theme.Red : Theme.Text);
+            else cardNow.Set(Txt.NA, mon.Running ? "Waiting for data..." : "Not recording", Theme.Text);
+
+            if (secs > 0)
+            {
+                cardAvg.Set(Gbs(sumRx / secs) + " / " + Gbs(sumTx / secs), "GB/s up / down  -  " + Pct(sumRx / secs, capRx) + " / " + Pct(sumTx / secs, capTx) + " of link", Theme.Text);
+                cardPeak.Set(Gbs(maxRx) + " / " + Gbs(maxTx), "Up at " + maxRxT.ToString("HH:mm:ss", Txt.Inv) + " (" + Pct(maxRx, capRx) + ")" + Txt.NL +
+                    "Down at " + maxTxT.ToString("HH:mm:ss", Txt.Inv) + " (" + Pct(maxTx, capTx) + ")", Theme.Text);
+                cardSat.Set(sat.ToString(sat < 60 ? "0.0" : "0", Txt.Inv) + " s",
+                    (sat / secs * 100).ToString("0.0", Txt.Inv) + " % of " + Dur(secs) + "  -  " + epCount + " episode(s)" + (inEpisode ? Txt.NL + "Bottleneck right now" : ""),
+                    sat > 0 ? Theme.Red : Theme.Green);
+            }
+            else
+            {
+                cardAvg.Set(Txt.NA, "", Theme.Text);
+                cardPeak.Set(Txt.NA, "", Theme.Text);
+                cardSat.Set(Txt.NA, "", Theme.Text);
+            }
+
+            if (newEps.Count > 0)
+            {
+                epList.BeginUpdate();
+                foreach (var e in newEps)
+                {
+                    var it = new ListViewItem(e.Start.ToString("HH:mm:ss", Txt.Inv));
+                    it.SubItems.Add(e.Seconds.ToString("0.0", Txt.Inv) + " s");
+                    it.SubItems.Add(e.Dir);
+                    it.SubItems.Add(e.PeakPct.ToString("0", Txt.Inv) + " %");
+                    it.SubItems.Add(e.App);
+                    epList.Items.Insert(0, it);
+                }
+                epList.EndUpdate();
+                epList.StretchLast();
+            }
+            if (monitorPage.Visible) graph.Invalidate();
+        }
+
+        void ExportMonitor()
+        {
+            using (var dlg = new SaveFileDialog())
+            {
+                dlg.Title = "Export PCIe recording";
+                dlg.Filter = "CSV file (*.csv)|*.csv";
+                dlg.FileName = "pcie-" + DateTime.Now.ToString("yyyyMMdd-HHmm", Txt.Inv) + ".csv";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                try { mon.ExportCsv(dlg.FileName); SetStatus("Saved " + dlg.FileName); }
+                catch (Exception ex) { MessageBox.Show(this, "Could not save:" + Txt.NL + ex.Message, "GPU Toggle", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            }
+        }
+
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == WM_DEVICECHANGE && debounce != null) { debounce.Stop(); debounce.Start(); }
@@ -1419,6 +2600,7 @@ namespace GpuToggle
 
             if (gpuPage.Visible) SetStatus(list.Items.Count + " GPU(s) found. Double-click a row to toggle. Stats refresh every 2 s.");
             UpdateButtons();
+            RefreshMonGpus();
         }
 
         void UpdateStats()
@@ -1497,6 +2679,14 @@ namespace GpuToggle
             btnEnable.Enabled = !busy && g != null && !g.Enabled;
             btnDisable.Enabled = !busy && g != null && g.Enabled;
             btnRefresh.Enabled = !busy;
+            btnPcie.Enabled = !busy && g != null && g.Enabled && g.IsPhysical;
+        }
+
+        void TestBandwidth()
+        {
+            var g = Selected;
+            if (g == null || !g.Enabled || !g.IsPhysical) return;
+            RunBandwidthTest(g);
         }
 
         void SetStatus(string s) { lblStatus.Text = s; }
@@ -1802,6 +2992,196 @@ namespace GpuToggle
             foreach (ListViewItem it in plist.SelectedItems) SelectedPaths.Add(it.SubItems[2].Text);
             if (SelectedPaths.Count == 0) return;
             DialogResult = DialogResult.OK;
+        }
+    }
+
+    // Measures how fast data moves between system memory and the GPU's VRAM, and shows the PCIe link it runs over.
+    class BandwidthDialog : Form
+    {
+        GpuInfo gpu;
+        Label lblLink, lblNote;
+        Panel results;
+        Button run;
+        BandwidthResult last;
+        string tunnel;
+        string state = "Click Run test. It takes a few seconds and briefly loads the GPU.";
+        double theoretical;
+
+        public BandwidthDialog(GpuInfo g)
+        {
+            gpu = g;
+            Text = "PCIe bandwidth - " + g.Name;
+            Font = Theme.Regular;
+            BackColor = Theme.Surface;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterParent;
+            MinimizeBox = false;
+            MaximizeBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(Ui.S(600), Ui.S(460));
+            Padding = new Padding(Ui.S(16));
+
+            var title = new Label();
+            title.Dock = DockStyle.Top;
+            title.Height = Ui.S(30);
+            title.Font = Theme.Title;
+            title.ForeColor = Theme.Text;
+            title.Text = g.Name;
+            title.AutoEllipsis = true;
+
+            lblLink = new Label();
+            lblLink.Dock = DockStyle.Top;
+            lblLink.Height = Ui.S(100);
+            lblLink.ForeColor = Theme.Text;
+            lblLink.Padding = new Padding(0, Ui.S(6), 0, 0);
+
+            results = new Panel();
+            results.Dock = DockStyle.Top;
+            results.Height = Ui.S(150);
+            results.BackColor = Theme.Card;
+            results.Paint += delegate (object s, PaintEventArgs e) { PaintResults(e.Graphics); };
+            typeof(Panel).GetProperty("DoubleBuffered", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(results, true, null);
+
+            lblNote = new Label();
+            lblNote.Dock = DockStyle.Fill;
+            lblNote.Font = Theme.Small;
+            lblNote.ForeColor = Theme.Muted;
+            lblNote.Padding = new Padding(0, Ui.S(10), 0, 0);
+            lblNote.Text =
+                "The test copies 64 MB blocks between system memory and VRAM with Direct3D 11 and times them on the GPU. " +
+                "Real transfers usually reach 80-90 % of the theoretical link bandwidth." + Txt.NL +
+                "Thunderbolt / USB4 eGPUs tunnel PCIe, so the reported link may not show the real limit " +
+                "(about 2.5-3.8 GB/s for Thunderbolt 3/4). The measured numbers are what counts.";
+
+            var bar = new FlowLayoutPanel();
+            bar.Dock = DockStyle.Bottom;
+            bar.AutoSize = true;
+            bar.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            bar.FlowDirection = FlowDirection.RightToLeft;
+            bar.BackColor = Theme.Surface;
+            var close = Theme.MakeButton("Close", Theme.Card, false);
+            close.DialogResult = DialogResult.Cancel;
+            run = Theme.MakeButton("Run test", Theme.Accent, true);
+            run.Click += delegate { Start(); };
+            bar.Controls.Add(close);
+            bar.Controls.Add(run);
+            CancelButton = close;
+            AcceptButton = run;
+
+            Controls.Add(lblNote);
+            Controls.Add(results);
+            Controls.Add(lblLink);
+            Controls.Add(title);
+            Controls.Add(bar);
+
+            try { tunnel = Pcie.Tunnel(g.InstanceId); } catch { tunnel = null; }
+            List<PcieLink> chain;
+            try { chain = Pcie.Chain(g.InstanceId); } catch { chain = new List<PcieLink>(); }
+            ShowLink(chain, true);
+        }
+
+        void ShowLink(List<PcieLink> chain, bool idle)
+        {
+            PcieLink own = chain.Count > 0 ? chain[0] : null;
+            if (own == null)
+            {
+                theoretical = 0;
+                lblLink.Text = "No PCIe link information for this GPU (integrated GPUs share system memory, " +
+                    "so the result shows memory copy speed instead).";
+                return;
+            }
+            var sb = new StringBuilder();
+            sb.Append("PCIe link:  " + own.CurText + (idle ? " (now, idle)" : " (under load)"));
+            if (own.MaxWidth > 0) sb.Append("   -   card supports " + own.MaxText);
+            theoretical = own.CurGBs;
+            if (tunnel != null)
+                sb.Append(Txt.NL + "Connected through a " + tunnel + " tunnel - that is usually the real limit, not the link above.");
+            if (theoretical > 0)
+                sb.Append(Txt.NL + "Theoretical:  " + theoretical.ToString("0.0", Txt.Inv) + " GB/s per direction");
+            if (idle) sb.Append(Txt.NL + "GPUs lower the link speed when idle; the test re-reads it under load.");
+            lblLink.Text = sb.ToString();
+        }
+
+        void Start()
+        {
+            run.Enabled = false;
+            last = null;
+            state = "Starting...";
+            results.Invalidate();
+            Cursor = Cursors.AppStarting;
+            var t = new Thread(delegate ()
+            {
+                BandwidthResult r;
+                try
+                {
+                    r = D3D11Bandwidth.Test(gpu, delegate (string msg) { Post(delegate { state = msg; results.Invalidate(); }); });
+                }
+                catch (Exception ex) { r = new BandwidthResult(); r.Error = ex.Message; }
+                Post(delegate { Done(r); });
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        void Post(MethodInvoker a)
+        {
+            try { if (!IsDisposed && IsHandleCreated) BeginInvoke(a); } catch { }
+        }
+
+        void Done(BandwidthResult r)
+        {
+            if (IsDisposed) return;
+            Cursor = Cursors.Default;
+            run.Enabled = true;
+            run.Text = "Run again";
+            if (r.Error != null) { state = "Test failed: " + r.Error; results.Invalidate(); return; }
+            last = r;
+            D3D11Bandwidth.LastResults[gpu.InstanceId] = r;
+            var chain = r.ChainLoad != null && r.ChainLoad.Count > 0 && r.ChainLoad[0] != null ? r.ChainLoad : r.Chain;
+            ShowLink(chain, chain == r.Chain);
+            state = null;
+            results.Invalidate();
+        }
+
+        void PaintResults(Graphics g)
+        {
+            var flags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+            using (var pen = new Pen(Theme.Border)) g.DrawRectangle(pen, 0, 0, results.Width - 1, results.Height - 1);
+            if (last == null)
+            {
+                var r0 = new Rectangle(Ui.S(16), 0, results.Width - Ui.S(32), results.Height);
+                TextRenderer.DrawText(g, state ?? "", Theme.Regular, r0, state != null && state.StartsWith("Test failed", StringComparison.Ordinal) ? Theme.Red : Theme.Muted,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+                return;
+            }
+            double scale = theoretical > 0 ? theoretical : Math.Max(last.UploadGBs, last.DownloadGBs) * 1.15;
+            DrawRow(g, Ui.S(18), "Host -> GPU  (upload)", last.UploadGBs, scale, flags);
+            DrawRow(g, Ui.S(82), "GPU -> Host  (download)", last.DownloadGBs, scale, flags);
+        }
+
+        void DrawRow(Graphics g, int y, string label, double gbs, double scale, TextFormatFlags flags)
+        {
+            int x = Ui.S(16), w = results.Width - Ui.S(32);
+            TextRenderer.DrawText(g, label, Theme.Semibold, new Rectangle(x, y, w, Ui.S(22)), Theme.Text, flags);
+            string val = gbs.ToString("0.00", Txt.Inv) + " GB/s";
+            if (theoretical > 0) val += "   (" + (gbs / theoretical * 100).ToString("0", Txt.Inv) + " % of link)";
+            TextRenderer.DrawText(g, val, Theme.Semibold, new Rectangle(x, y, w, Ui.S(22)), Theme.Accent,
+                (flags & ~TextFormatFlags.Left) | TextFormatFlags.Right);
+            int bh = Ui.S(10);
+            var track = new Rectangle(x, y + Ui.S(30), w, bh);
+            var old = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var path = Theme.Round(track, bh / 2f))
+            using (var br = new SolidBrush(Theme.Border))
+                g.FillPath(br, path);
+            int fw = scale > 0 ? (int)Math.Round(w * Math.Min(1.0, gbs / scale)) : 0;
+            if (fw > 0)
+            {
+                using (var path = Theme.Round(new Rectangle(track.X, track.Y, Math.Max(fw, bh), bh), bh / 2f))
+                using (var br = new SolidBrush(Theme.Accent))
+                    g.FillPath(br, path);
+            }
+            g.SmoothingMode = old;
         }
     }
 

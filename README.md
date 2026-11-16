@@ -6,10 +6,11 @@ Công cụ WinForms nhỏ giúp **bật/tắt nhanh GPU khi dùng eGPU**: ví d�
 
 ## Giao diện
 
-Cửa sổ có thanh tiêu đề màu navy kèm logo, và 2 trang chuyển qua lại bằng nút trên thanh tiêu đề:
+Cửa sổ có thanh tiêu đề màu navy kèm logo, và 3 trang chuyển qua lại bằng nút trên thanh tiêu đề:
 
 - **GPUs**: bảng card đồ họa và bảng màn hình. Trạng thái hiện dạng nhãn màu (xanh = Enabled, xám = Disabled, đỏ = Error), cột Load có thanh tải.
 - **Apps / Games**: chọn GPU cho từng game hoặc ứng dụng nặng (xem bên dưới).
+- **PCIe monitor**: đồ thị băng thông PCIe thời gian thực khi chơi game, kèm nhật ký những lần bị nghẽn.
 
 ## Tính năng
 
@@ -25,6 +26,28 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 2 trang chuyển qua l
 - **Remove** xoá cài đặt riêng, trả game về lựa chọn mặc định của Windows. **Windows Graphics settings** mở trang cài đặt gốc của Windows.
 
 > Lưu ý: game chạy qua launcher (Steam, Epic…) thì nên thêm file `.exe` của chính game, không phải file của launcher. Nếu game đang chạy thì dùng **Add running app...** cho nhanh.
+
+### Đo băng thông PCIe (nút **PCIe bandwidth...** trên trang GPUs)
+
+- Đo tốc độ chép dữ liệu thật giữa RAM và VRAM theo cả 2 chiều, **Host -> GPU** và **GPU -> Host**. App dùng Direct3D 11 (chép các khối 64 MB, bấm giờ bằng timestamp của GPU) nên chạy được với mọi hãng GPU.
+- Hiện link PCIe đang chạy (vd. `Gen4 x4`), mức link card hỗ trợ, băng thông lý thuyết và kết quả đo đạt bao nhiêu % so với lý thuyết.
+- Tự nhận ra eGPU cắm qua **USB4 / Thunderbolt** (ASMedia ASM2464, chip Thunderbolt của Intel). Với các eGPU này, đường hầm USB4/Thunderbolt thường mới là giới hạn thật, chứ không phải link PCIe mà Windows báo.
+
+### Theo dõi PCIe khi chơi game (trang PCIe monitor, chỉ card NVIDIA)
+
+- Bấm **Start recording** rồi mở game. App đọc lưu lượng PCIe 4 lần mỗi giây qua NVML (`nvml.dll`, có sẵn trong driver NVIDIA), kể cả khi cửa sổ app bị thu nhỏ.
+- **Đồ thị thời gian thực** 2 phút gần nhất cho 2 chiều upload / download, tính theo % giới hạn link. Vùng tô đỏ là lúc bị nghẽn.
+- Các thẻ số liệu:
+  - **Now**: lưu lượng hiện tại.
+  - **Average**: lưu lượng trung bình cả phiên.
+  - **Peak**: lưu lượng cao nhất, kèm thời điểm đạt được.
+  - **Bottleneck time**: tổng thời gian nghẽn, bao nhiêu % thời lượng phiên và số lần nghẽn.
+- **Bottleneck log**: ghi lại mọi lần nghẽn dài từ 0,5 giây trở lên, gồm giờ bắt đầu, thời lượng, chiều nghẽn, mức đỉnh và ứng dụng đang mở ở cửa sổ trước.
+- Ngưỡng nghẽn mặc định là 80 % giới hạn link, chỉnh được.
+- **Measure limit...** chạy bài đo băng thông để lấy giới hạn thật làm mốc 100 %, nên làm một lần trước khi ghi. Nếu chưa đo, app dùng băng thông lý thuyết của link. Trong lúc bài đo chạy, app tạm dừng ghi.
+- **Export CSV...** xuất file CSV gồm số liệu tổng hợp, danh sách các lần nghẽn và toàn bộ mẫu đo theo thời gian.
+
+> NVML đếm lưu lượng thô trên link của card, có cả phần overhead của giao thức, nên con số GB/s ở đây thường cao hơn kết quả bài đo. Hãy xem cột % để đánh giá mức nghẽn. Card AMD/Intel không cho ứng dụng đọc bộ đếm lưu lượng PCIe, nên với các card này chỉ dùng được bài đo băng thông.
 
 ### Bật/tắt GPU (trang GPUs)
 
