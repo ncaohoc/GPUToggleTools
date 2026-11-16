@@ -8,7 +8,7 @@ if not exist "%CSC%" (
   pause
   exit /b 1
 )
-"%CSC%" /nologo /target:winexe /platform:x64 /optimize+ /out:GpuToggle.exe /win32manifest:app.manifest /win32icon:app.ico /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll GpuToggle.cs
+"%CSC%" /nologo /target:winexe /platform:x64 /optimize+ /out:GpuToggle.exe /win32manifest:app.manifest /win32icon:app.ico /resource:app.ico /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll GpuToggle.cs
 if errorlevel 1 (
   echo.
   echo Build FAILED
