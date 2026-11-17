@@ -6,11 +6,12 @@ Công cụ WinForms nhỏ giúp **bật/tắt nhanh GPU khi dùng eGPU**: ví d�
 
 ## Giao diện
 
-Cửa sổ có thanh tiêu đề màu navy kèm logo, và 3 trang chuyển qua lại bằng nút trên thanh tiêu đề:
+Cửa sổ có thanh tiêu đề màu navy kèm logo, và 4 trang chuyển qua lại bằng nút trên thanh tiêu đề:
 
 - **GPUs**: bảng card đồ họa và bảng màn hình. Trạng thái hiện dạng nhãn màu (xanh = Enabled, xám = Disabled, đỏ = Error), cột Load có thanh tải.
 - **Apps / Games**: chọn GPU cho từng game hoặc ứng dụng nặng (xem bên dưới).
 - **PCIe monitor**: đồ thị băng thông PCIe thời gian thực khi chơi game, kèm nhật ký những lần bị nghẽn.
+- **OSD**: lớp thông số hiện đè lên game (FPS, GPU, VRAM, CPU, RAM, PCIe) và cho biết cái gì đang giới hạn FPS.
 - **Dark mode**: nút **Theme** ở góc phải thanh tiêu đề đổi lần lượt *Auto* (theo cài đặt sáng/tối của Windows) → *Light* → *Dark*. Đổi ngay không cần mở lại app, lựa chọn được lưu lại (`HKCU/Software/GPUToggle`).
 
 ## Tính năng
@@ -51,6 +52,35 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 3 trang chuyển qua l
 
 > NVML đếm lưu lượng thô trên link của card, có cả phần overhead của giao thức, nên con số GB/s ở đây thường cao hơn kết quả bài đo. Hãy xem cột % để đánh giá mức nghẽn. Card AMD/Intel không cho ứng dụng đọc bộ đếm lưu lượng PCIe, nên với các card này chỉ dùng được bài đo băng thông.
 
+### OSD trong game (trang OSD)
+
+- Bấm **Show OSD**, hoặc nhấn **Ctrl+Shift+O** ngay trong game, để bật/tắt bảng thông số ở góc màn hình. Bảng này không nhận chuột hay bàn phím (click xuyên qua) và không bao giờ cướp focus của game.
+- Các dòng hiện trên OSD (chọn được từng dòng):
+  - **FPS**: số khung hình/giây, thời gian mỗi khung (ms) và **1 % low** trong 10 giây gần nhất.
+  - **GPU**: tải %, nhiệt độ, công suất (W). Chuyển màu cam/đỏ khi gần chạm giới hạn công suất hoặc nóng.
+  - **VRAM**: dung lượng đã dùng / tổng.
+  - **CPU**: tải tổng, **luồng bận nhất** (`max`) và nhiệt độ CPU.
+  - **RAM**: dung lượng đã dùng / tổng.
+  - **PCIe**: lưu lượng ↑ Host -> GPU và ↓ GPU -> Host (GB/s), kèm % so với giới hạn đo thực tế (chỉ card NVIDIA).
+  - **LIM**: thứ đang giới hạn FPS, tính trung bình 3 giây gần nhất.
+- Chọn được GPU cần theo dõi. Mặc định **Auto** là card mà game ở cửa sổ trước đang chạy. Chọn được góc màn hình, cỡ chữ và độ đậm của nền. Mọi lựa chọn được lưu lại.
+- Trang OSD hiện các thẻ số liệu giống hệt OSD, cộng thêm thẻ **What limits the FPS** giải thích chi tiết:
+
+| Kết luận | Điều kiện | Nên làm gì |
+|---|---|---|
+| **GPU-bound** | GPU ≥ 95 % | Bình thường. Muốn thêm FPS thì giảm độ phân giải / thiết lập, hoặc bật DLSS / FSR. |
+| **CPU-bound** | Luồng CPU bận nhất ≥ 90 %, GPU < 95 % | GPU đang chờ CPU. Tăng độ phân giải không mất FPS; giảm tầm nhìn xa, mật độ NPC, vật lý. |
+| **PCIe link** | Lưu lượng ≥ 90 % giới hạn đo thực tế | Thường gặp với eGPU. Giảm texture / độ phân giải, cắm màn hình thẳng vào eGPU. |
+| **VRAM full** | VRAM ≥ 95 % | Texture tràn sang RAM và phải đi qua PCIe nên bị giật. Giảm chất lượng texture. |
+| **V-Sync / refresh cap** | FPS bằng tần số quét màn hình | Game đang bị khóa FPS, không có gì bị nghẽn. |
+| **Limited elsewhere** | Không có gì chạm ngưỡng | Do giới hạn FPS trong game, engine, hoặc một luồng game nhảy qua lại giữa các nhân. |
+
+> - FPS được đọc từ sự kiện present mà Windows tự ghi lại (ETW, giống PresentMon), app **không chèn gì vào game** nên an toàn với anti-cheat. Đo được DirectX 9 – 12; Vulkan / OpenGL được đếm qua sự kiện đồ họa của kernel. App đo FPS của **cửa sổ đang ở trước**. Nếu bạn chuyển sang cửa sổ GPU Toggle để xem trang OSD, app vẫn giữ game vừa chơi.
+> - OSD là cửa sổ luôn nằm trên cùng, nên hiện được trên game chạy **cửa sổ** hoặc **borderless**. Game chạy *exclusive fullscreen* có thể che mất OSD, khi đó hãy chuyển game sang borderless.
+> - Windows không có API chuẩn cho nhiệt độ CPU. App đọc từ **LibreHardwareMonitor** (hoặc OpenHardwareMonitor) nếu chương trình đó đang chạy, nếu không thì dùng *ACPI thermal zone* (chỉ gần đúng, một số máy không có). Nhiệt độ GPU AMD cũng chỉ có khi LibreHardwareMonitor đang chạy.
+> - Để % PCIe chính xác, hãy chạy **PCIe bandwidth...** một lần cho card. Nếu chưa đo thì 100 % là băng thông lý thuyết của link.
+> - Nếu Ctrl+Shift+O đã bị app khác chiếm, dòng thông tin trên trang OSD sẽ báo, khi đó dùng nút **Show OSD**.
+
 ### Bật/tắt GPU (trang GPUs)
 
 - **Tự quét GPU** qua WMI. App liệt kê tên, hãng (NVIDIA/AMD/Intel), trạng thái (Enabled / Disabled / Error) và Instance ID. Adapter ảo (Remote Display…) mặc định bị ẩn, muốn xem thì tick **Show virtual adapters**.
@@ -74,7 +104,7 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 3 trang chuyển qua l
 
 ## Build
 
-Không cần Visual Studio hay .NET SDK. Để các file `GpuToggle.cs`, `app.manifest`, `app.ico`, `build.bat` chung một thư mục rồi chạy:
+Không cần Visual Studio hay .NET SDK. Để các file `GpuToggle.cs`, `Osd.cs`, `app.manifest`, `app.ico`, `build.bat` chung một thư mục rồi chạy:
 
 ```bat
 build.bat

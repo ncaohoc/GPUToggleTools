@@ -238,12 +238,21 @@ namespace GpuToggle
         // Returns luid -> load % (busiest engine, like Task Manager)
         public static Dictionary<string, float> Load()
         {
+            Dictionary<int, Dictionary<string, float>> pidLoad;
+            var result = Load(ref prev, out pidLoad);
+            LastPidLoad = pidLoad;
+            return result;
+        }
+
+        // Same, with the caller's own previous samples (the OSD reads the counters on its own thread and rate).
+        public static Dictionary<string, float> Load(ref Dictionary<string, CounterSample> prev, out Dictionary<int, Dictionary<string, float>> pidLoad)
+        {
             var result = new Dictionary<string, float>();
             var cat = new PerformanceCounterCategory("GPU Engine");
             InstanceDataCollection col = cat.ReadCategory()["Utilization Percentage"];
             var sums = new Dictionary<string, float>();
             var next = new Dictionary<string, CounterSample>();
-            var pidLoad = new Dictionary<int, Dictionary<string, float>>();
+            pidLoad = new Dictionary<int, Dictionary<string, float>>();
             foreach (InstanceData d in col.Values)
             {
                 next[d.InstanceName] = d.Sample;
@@ -272,7 +281,6 @@ namespace GpuToggle
                 sums[key] = s + v;
             }
             prev = next;
-            LastPidLoad = pidLoad;
             foreach (var kv in sums)
             {
                 string luid = kv.Key.Substring(0, kv.Key.IndexOf('|'));
@@ -422,6 +430,14 @@ namespace GpuToggle
         static extern bool EnumDisplaySettings(string device, int mode, ref DEVMODE dm);
 
         const int ATTACHED = 0x1, PRIMARY = 0x4;
+
+        // Refresh rate of a display (e.g. Screen.DeviceName), or 0.
+        public static int RefreshHz(string device)
+        {
+            var dm = new DEVMODE();
+            dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+            return EnumDisplaySettings(device, -1, ref dm) ? dm.dmDisplayFrequency : 0;
+        }
 
         public static List<DisplayInfo> List()
         {
@@ -688,6 +704,27 @@ namespace GpuToggle
             rx = r * 1024.0;
             tx = t * 1024.0;
             return true;
+        }
+
+        [StructLayout(LayoutKind.Sequential)] struct NvmlUtil { public uint Gpu, Memory; }
+        [StructLayout(LayoutKind.Sequential)] struct NvmlMem { public ulong Total, Free, Used; }
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetUtilizationRates(IntPtr device, out NvmlUtil util);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetTemperature(IntPtr device, int sensor, out uint temp);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetPowerUsage(IntPtr device, out uint milliwatts);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetEnforcedPowerLimit(IntPtr device, out uint milliwatts);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetMemoryInfo(IntPtr device, out NvmlMem mem);
+
+        // Load %, temperature C, power W, power limit W, VRAM used / total bytes. -1 where unsupported.
+        public static void Basic(IntPtr h, out float load, out float temp, out float watts, out float limit, out double used, out double total)
+        {
+            load = temp = watts = limit = -1;
+            used = total = -1;
+            NvmlUtil u; uint t, p; NvmlMem m;
+            if (nvmlDeviceGetUtilizationRates(h, out u) == 0) load = u.Gpu;
+            if (nvmlDeviceGetTemperature(h, 0, out t) == 0) temp = t;
+            if (nvmlDeviceGetPowerUsage(h, out p) == 0) watts = p / 1000f;
+            if (nvmlDeviceGetEnforcedPowerLimit(h, out p) == 0) limit = p / 1000f;
+            if (nvmlDeviceGetMemoryInfo(h, out m) == 0 && m.Total > 0) { used = m.Used; total = m.Total; }
         }
 
         public static string Link(IntPtr h, out int gen, out int width)
@@ -2054,7 +2091,7 @@ namespace GpuToggle
         }
     }
 
-    class MainForm : Form
+    partial class MainForm : Form
     {
         const int RevertSeconds = 15;
         const int WM_DEVICECHANGE = 0x0219;
@@ -2066,7 +2103,7 @@ namespace GpuToggle
         StyledList list, dispList, appsList;
         Button btnEnable, btnDisable, btnRefresh, btnPcie;
         Button btnAddApp, btnAddRunning, btnRemoveApp, btnLaunch, btnGfxSettings, btnPrefAuto, btnPrefSave, btnPrefPerf;
-        Button navGpus, navApps, navMon, navTheme;
+        Button navGpus, navApps, navMon, navOsd, navTheme;
         int curPage;
         Panel gpuPage, appsPage, monitorPage, header;
         // PCIe monitor page
@@ -2099,7 +2136,7 @@ namespace GpuToggle
             BackColor = Theme.Surface;
             ForeColor = Theme.Text;
             Theme.Hook(this);
-            ClientSize = new Size(Ui.S(1120), Ui.S(680));
+            ClientSize = new Size(Ui.S(1180), Ui.S(680));
             MinimumSize = new Size(Ui.S(960), Ui.S(560));
             StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
@@ -2109,6 +2146,7 @@ namespace GpuToggle
             BuildGpuPage();
             BuildAppsPage();
             BuildMonitorPage();
+            BuildOsdPage();
 
             var content = new Panel();
             content.Dock = DockStyle.Fill;
@@ -2117,6 +2155,7 @@ namespace GpuToggle
             content.Controls.Add(gpuPage);
             content.Controls.Add(appsPage);
             content.Controls.Add(monitorPage);
+            content.Controls.Add(osdPage);
 
             var statusBar = new Panel();
             statusBar.Dock = DockStyle.Bottom;
@@ -2251,6 +2290,9 @@ namespace GpuToggle
             navGpus.Click += delegate { ShowPage(0); };
             navApps.Click += delegate { ShowPage(1); };
             navMon.Click += delegate { ShowPage(2); };
+            navOsd = MakeNav("OSD");
+            navOsd.Width = Ui.S(84);
+            navOsd.Click += delegate { ShowPage(3); };
             navTheme = MakeNav("");
             navTheme.Width = Ui.S(104);
             navTheme.Margin = new Padding(Ui.S(14), 0, 0, 0);
@@ -2265,6 +2307,7 @@ namespace GpuToggle
             nav.Controls.Add(navGpus);
             nav.Controls.Add(navApps);
             nav.Controls.Add(navMon);
+            nav.Controls.Add(navOsd);
             nav.Controls.Add(navTheme);
             header.Controls.Add(nav);
 
@@ -2299,7 +2342,7 @@ namespace GpuToggle
         // Header buttons: selected page highlighted; theme button shows the current mode.
         void StyleNav()
         {
-            Button[] navs = { navGpus, navApps, navMon, navTheme };
+            Button[] navs = { navGpus, navApps, navMon, navOsd, navTheme };
             for (int i = 0; i < navs.Length; i++)
             {
                 bool sel = i == curPage;
@@ -2320,9 +2363,12 @@ namespace GpuToggle
             gpuPage.Visible = page == 0;
             appsPage.Visible = page == 1;
             monitorPage.Visible = page == 2;
+            osdPage.Visible = page == 3;
             StyleNav();
+            UpdateOsdRunning();
             if (page == 1) RefreshApps();
             else if (page == 2) SetStatus("Start recording, then play your game. NVIDIA GPUs only (NVML). Shaded areas = PCIe bottleneck.");
+            else if (page == 3) SetStatus("Show the OSD (or press Ctrl+Shift+O in game), then play. The bottleneck card says what limits the FPS.");
             else SetStatus(list.Items.Count + " GPU(s) found. Double-click a row to toggle. Stats refresh every 2 s.");
         }
 
@@ -2821,6 +2867,7 @@ namespace GpuToggle
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == WM_DEVICECHANGE && debounce != null) { debounce.Stop(); debounce.Start(); }
+            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == OsdHotkeyId) ToggleOsd();
             base.WndProc(ref m);
         }
 
@@ -2860,6 +2907,7 @@ namespace GpuToggle
             if (gpuPage.Visible) SetStatus(list.Items.Count + " GPU(s) found. Double-click a row to toggle. Stats refresh every 2 s.");
             UpdateButtons();
             RefreshMonGpus();
+            RefreshOsdGpus();
         }
 
         void UpdateStats()
