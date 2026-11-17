@@ -102,7 +102,8 @@ if ($DryRun) {
 
 # ---- commit, tag, push, GitHub release
 Run git @('add', 'VERSION')
-Run git @('commit', '--quiet', '-m', "Release $tag")
+& git diff --cached --quiet -- VERSION
+if ($LASTEXITCODE -ne 0) { Run git @('commit', '--quiet', '-m', "Release $tag") }   # unchanged on the first release of a number
 Run git @('tag', '-a', $tag, '-m', "GPU Toggle $tag")
 Run git @('push', 'origin', 'main')
 Run git @('push', 'origin', $tag)
