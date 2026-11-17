@@ -2,18 +2,21 @@
 
 Công cụ WinForms nhỏ giúp **bật/tắt nhanh GPU khi dùng eGPU**: ví dụ tắt iGPU để máy chỉ chạy bằng eGPU, hoặc tắt eGPU trước khi rút dây.
 
+**Vì sao có tool này:** người dùng eGPU nên tập thói quen *Disable + rút eGPU trước khi tắt máy*, rồi *cắm eGPU + Enable sau khi đã vào Windows*. Làm vậy thì tránh được lỗi eGPU (Code 43, màn hình đen) và tránh được cảnh Windows phát hiện phần cứng thay đổi rồi **bắt đặt lại PIN mỗi lần khởi động**. Trước đây mỗi lần như vậy phải mở Device Manager. GPU Toggle làm việc này bằng một cú double-click, kèm chốt an toàn tự bật lại card sau 15 giây nếu màn hình bị đen. Chi tiết ở phần [Lưu ý khi dùng eGPU](#lưu-ý-khi-dùng-egpu).
+
 ![icon](app.ico)
 
 **Tải về:** [GpuToggle.exe bản mới nhất](https://github.com/ncaohoc/GPUToggleTools/releases/latest/download/GpuToggle.exe). Các bản cũ và ghi chú thay đổi nằm ở trang [Releases](https://github.com/ncaohoc/GPUToggleTools/releases). Tải xong mở luôn, không cần cài đặt.
 
 ## Giao diện
 
-Cửa sổ có thanh tiêu đề màu navy kèm logo, và 4 trang chuyển qua lại bằng nút trên thanh tiêu đề:
+Cửa sổ có thanh tiêu đề màu navy kèm logo, và 5 trang chuyển qua lại bằng nút trên thanh tiêu đề:
 
 - **GPUs**: bảng card đồ họa và bảng màn hình. Trạng thái hiện dạng nhãn màu (xanh = Enabled, xám = Disabled, đỏ = Error), cột Load có thanh tải.
 - **Apps / Games**: chọn GPU cho từng game hoặc ứng dụng nặng (xem bên dưới).
 - **PCIe monitor**: đồ thị băng thông PCIe thời gian thực khi chơi game, kèm nhật ký những lần bị nghẽn.
 - **OSD**: lớp thông số hiện đè lên game (FPS, GPU, VRAM, CPU, RAM, PCIe) và cho biết cái gì đang giới hạn FPS.
+- **Repair**: nhóm công cụ sửa lỗi: gỡ sạch driver NVIDIA / AMD và tự sửa lỗi Code 43 (xem bên dưới).
 - **Dark mode**: công tắc mặt trời / mặt trăng ở góc phải thanh tiêu đề. Lúc chưa bấm, app theo chế độ sáng/tối của Windows; đã bấm thì app nhớ lựa chọn (`HKCU/Software/GPUToggle`). Đổi ngay không cần mở lại app.
 
 ## Tính năng
@@ -101,6 +104,41 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 4 trang chuyển qua l
   - Khi tắt GPU vật lý cuối cùng còn chạy, app hiện cảnh báo, nút mặc định là **No**. Windows sẽ chuyển sang Microsoft Basic Display Adapter.
   - Sau khi tắt, app mở hộp đếm ngược **15 giây**. Nếu không bấm **Keep**, GPU tự bật lại, nên bạn không bị kẹt khi màn hình đen.
 
+### Sửa lỗi (trang Repair)
+
+Các công cụ này can thiệp sâu vào hệ thống nên được gom riêng một trang, mọi bước đều ghi vào ô **Log** ở cuối trang.
+
+**Driver cleanup: gỡ sạch driver NVIDIA / AMD** (giống DDU)
+
+- Chọn **NVIDIA** hoặc **AMD** (app tự chọn theo card đang có) rồi bấm **Remove driver...**. App quét trước và ghi ra Log toàn bộ những gì sẽ xoá, hỏi lại rồi mới làm:
+  1. Tạo restore point (tick **Create a restore point first**; Windows chỉ tạo tối đa 1 điểm mỗi 24 giờ).
+  2. Tắt các chương trình và service của hãng (NVIDIA App, NVDisplay.Container, AMD External Events...).
+  3. Xoá mọi gói driver của hãng khỏi driver store (`pnputil /delete-driver /uninstall /force`): driver màn hình, âm thanh HDMI, USB-C, Virtual Audio...
+  4. Xoá service, gỡ thiết bị (GPU và âm thanh HDMI của nó).
+  5. Xoá thư mục còn sót, cài đặt, shader cache và mục gỡ cài đặt trong Control Panel (tick **Also delete leftover folders...**). File đang bị khoá sẽ được xoá ở lần khởi động sau.
+  6. Quét lại phần cứng: GPU quay về *Microsoft Basic Display Adapter*. Khởi động lại rồi cài driver mới.
+- Với AMD, app chỉ xoá phần của card Radeon (driver màn hình, âm thanh HDMI, Crash Defender, AMD Software). **Driver chipset AMD không bị đụng tới.**
+- **Stop Windows Update from installing drivers**: chặn Windows Update tự cài lại driver cũ ngay sau khi gỡ. Có hiệu lực ngay khi tick, bỏ tick để cho phép lại.
+- **Restart to Safe Mode...**: khởi động vào Safe Mode **một lần** (cách gỡ sạch nhất vì không driver GPU nào được nạp). Mở lại GPU Toggle trong Safe Mode, app tự mở trang Repair. Lần khởi động sau tự về chế độ thường, không bị kẹt trong Safe Mode. App dùng một mục boot tạm (`bcdedit /bootsequence`) và tự xoá mục này khi về lại chế độ thường.
+
+> **Quan trọng trước khi vào Safe Mode: đăng nhập bằng PIN**
+> - Safe Mode **không có mạng** và thường **không nhận PIN / Windows Hello**, bạn phải nhập **mật khẩu tài khoản**. Với tài khoản Microsoft, đó là mật khẩu Microsoft (máy phải từng đăng nhập bằng mật khẩu này).
+> - Nếu Windows bắt đặt lại PIN khi khởi động (thường do phát hiện phần cứng thay đổi, ví dụ vừa cắm hoặc rút eGPU), bạn **không làm được trong Safe Mode** vì cần mạng để xác minh.
+> - Nếu bị kẹt ở màn hình đăng nhập: bấm biểu tượng nguồn ở góc màn hình đăng nhập → **Restart**. Vì app chỉ đặt Safe Mode cho **một lần** khởi động, máy sẽ quay về chế độ thường. Tránh dùng cách bật Safe Mode bằng `msconfig`: cách đó lặp lại mãi đến khi tắt được.
+> - Không chắc nhớ mật khẩu? Đừng vào Safe Mode, cứ bấm **Remove driver...** ngay ở chế độ thường (vẫn gỡ được, chỉ kém sạch hơn một chút).
+
+**Fix code 43**
+
+- Ô trạng thái cho biết GPU nào đang bị Windows dừng với lỗi **Code 43**. Bấm **Fix code 43**, app thử từ nhẹ đến mạnh và dừng ngay khi GPU chạy lại:
+  1. Khởi động lại thiết bị (`pnputil /restart-device`, hoặc tắt rồi bật).
+  2. Gỡ thiết bị rồi quét lại phần cứng để Windows cài lại từ đầu.
+  3. Xoá các adapter "ma" (eGPU từng cắm ở cổng khác) rồi quét lại.
+  4. **Chỉ dành cho người dùng eGPU** (tick **I use an eGPU**, card NVIDIA): ghi `RM1774520 = 1` (DWORD) vào khoá driver của card (`HKLM/SYSTEM/CurrentControlSet/Control/Class/{4d36e968-e325-11ce-bfc1-08002be10318}/NNNN`) rồi khởi động lại card. Đây là cách sửa lỗi 43 cho card NVIDIA cắm qua hộp eGPU, lấy từ [nvidia-error43-fix](https://github.com/AleCyriaco/nvidia-error43-fix) (MIT), dựa trên nvidia-error43-fixer của nando4 (egpu.io). NVIDIA không công bố tài liệu cho giá trị này.
+  5. Cũng chỉ khi tick ô eGPU: tắt Fast Startup và PCIe Link State Power Management (có tác dụng sau khi khởi động lại).
+- Ô **I use an eGPU** mặc định không tick, app tự tick khi card lỗi nằm sau chip USB4 / Thunderbolt. Hộp eGPU cắm qua OCuLink hoặc M.2 thì app không nhận ra được, bạn tự tick. Người dùng card gắn trong máy (không phải eGPU) không nên tick.
+- Giá trị `RM1774520` mất khi cài lại hoặc cập nhật driver: bấm **Fix code 43** lại. Muốn bỏ thì xoá giá trị `RM1774520` trong khoá driver ở trên (đường dẫn đầy đủ có trong Log), hoặc gỡ card trong Device Manager rồi khởi động lại.
+- Nếu vẫn lỗi, Log ghi các bước nên làm tiếp: gỡ sạch driver bằng Driver cleanup rồi cài lại, tập thói quen cắm / rút eGPU đúng lúc (xem [Lưu ý khi dùng eGPU](#lưu-ý-khi-dùng-egpu)), đổi cổng / cáp, bật Thunderbolt PCIe tunneling và Above 4G decoding trong BIOS.
+
 ## Yêu cầu
 
 - Windows 10 bản 2004 trở lên, hoặc Windows 11 (`pnputil /enable-device`).
@@ -126,6 +164,7 @@ Mã nguồn chia theo trách nhiệm, mỗi file một class:
 | `src/Hardware` | Đọc phần cứng: danh sách GPU và bật/tắt (pnputil), DXGI, perf counter, NVML, nvidia-smi, màn hình, CPU/RAM, cảm biến nhiệt |
 | `src/Pcie` | Thông tin link PCIe, bài đo băng thông D3D11, bộ ghi PCIe monitor, xuất CSV |
 | `src/Apps` | Lựa chọn GPU cho từng app (registry của Windows Graphics settings) |
+| `src/Repair` | Gỡ sạch driver (driver store, service, thư mục), sửa Code 43, khởi động Safe Mode một lần, chặn Windows Update cài driver |
 | `src/Osd` | Đếm FPS (ETW), bộ lấy mẫu, đánh giá nghẽn, cài đặt và cửa sổ OSD |
 | `src/UI` | `MainForm` (khung cửa sổ, chuyển trang), theme, control tự vẽ, hộp thoại, và mỗi trang một class trong `src/UI/Pages` |
 
@@ -134,6 +173,12 @@ Thêm trang mới: tạo class kế thừa `AppPage` trong `src/UI/Pages` rồi 
 > Mã nguồn viết theo cú pháp C# 5 (để `csc.exe` có sẵn của Windows biên dịch được), chỉ dùng ASCII và cố ý không dùng ký tự `\`, vì ký tự này có thể bị mất khi tải file về.
 
 ## Lưu ý khi dùng eGPU
+
+> **Thói quen nên tập để tránh lỗi Code 43, màn hình đen và việc bị bắt đặt lại PIN** (đây chính là việc GPU Toggle được làm ra để làm nhanh, thay cho Device Manager):
+> - **Trước khi tắt máy** (Shut down / Restart / Sleep lâu): vào trang GPUs, chọn eGPU → **Disable**, rồi **rút dây eGPU**.
+> - **Sau khi mở máy**: chờ Windows khởi động xong và đăng nhập vào desktop, rồi mới **cắm dây eGPU**, sau đó vào trang GPUs → **Enable** nếu nó đang Disabled.
+> - Lý do: khi eGPU có mặt lúc khởi động (nhất là khi Fast Startup đang bật), BIOS / Windows phải cấp tài nguyên PCIe cho card ngay từ đầu. Việc này hay lỗi với hộp USB4 / Thunderbolt và sinh ra Code 43, màn hình đen hoặc adapter "ma". Cắm nóng sau khi vào Windows thì driver nhận card trong trạng thái sạch.
+> - Thêm nữa, eGPU xuất hiện hoặc biến mất giữa các lần khởi động có thể khiến Windows coi là phần cứng đã thay đổi và **bắt đặt lại PIN** (Windows Hello) khi đăng nhập. Khi eGPU luôn vắng mặt lúc khởi động, phần cứng lúc boot không đổi nên Windows không hỏi lại.
 
 - **Tắt iGPU làm màn hình gắn eGPU cũng tắt?** Trước khi tắt iGPU, bấm `Win + P` và chọn **Second screen only**. Bạn cũng nên kiểm tra ở *Settings → System → Display → Advanced display* rằng màn hình ngoài đang *Connected to* card eGPU. Nếu nó hiện iGPU, hãy cắm dây thẳng vào cổng trên card.
 - Màn hình đen: thử `Win + Ctrl + Shift + B`, rút ra cắm lại dây, hoặc chờ 15 giây để app tự bật lại GPU.

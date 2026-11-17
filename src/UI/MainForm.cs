@@ -20,6 +20,7 @@ namespace GpuToggle
         readonly AppsPage appsPage = new AppsPage();
         readonly PcieMonitorPage monitorPage = new PcieMonitorPage();
         readonly OsdPage osdPage = new OsdPage();
+        readonly RepairPage repairPage = new RepairPage();
         readonly List<AppPage> pages = new List<AppPage>();
         readonly List<Button> navs = new List<Button>();
         int curPage;
@@ -48,10 +49,12 @@ namespace GpuToggle
             pages.Add(appsPage);
             pages.Add(monitorPage);
             pages.Add(osdPage);
+            pages.Add(repairPage);
             foreach (var p in pages) p.StatusChanged += SetStatus;
 
             // Wiring between pages
-            gpusPage.GpusChanged += delegate (List<GpuInfo> gpus) { monitorPage.SetGpus(gpus); osdPage.SetGpus(gpus); };
+            gpusPage.GpusChanged += delegate (List<GpuInfo> gpus) { monitorPage.SetGpus(gpus); osdPage.SetGpus(gpus); repairPage.SetGpus(gpus); };
+            repairPage.DevicesChanged += delegate { gpusPage.RefreshList(); };
             gpusPage.BandwidthTestRequested += delegate (GpuInfo g) { monitorPage.RunBandwidthTest(g); };
             stats = new StatsPoller(this, delegate { return gpusPage.Gpus; }, appsPage.AppPaths);
             stats.Updated += delegate (StatsResult r) { gpusPage.ApplyStats(r); appsPage.ApplyStats(r); };
@@ -82,7 +85,7 @@ namespace GpuToggle
 
             Shown += delegate
             {
-                ShowPage(0);
+                ShowPage(SafeBoot.InSafeMode ? pages.IndexOf(repairPage) : 0);
                 gpusPage.RefreshList();
                 appsPage.RefreshApps();
                 stats.Start();
