@@ -110,15 +110,28 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 4 trang chuyển qua l
 
 ## Build
 
-Không cần Visual Studio hay .NET SDK. Để các file `GpuToggle.cs`, `Osd.cs`, `VERSION`, `app.manifest`, `app.ico`, `build.bat` chung một thư mục rồi chạy:
+Không cần Visual Studio hay .NET SDK. Giữ nguyên thư mục `src/` cùng các file `VERSION`, `app.manifest`, `app.ico`, `build.bat` rồi chạy:
 
 ```bat
 build.bat
 ```
 
-Script dùng `csc.exe` có sẵn trong `%SystemRoot%/Microsoft.NET/Framework64/v4.0.30319/` và tạo ra `GpuToggle.exe`. Build xong chỉ cần giữ lại file `.exe`. Version lấy từ file `VERSION`: script sinh ra `Version.cs` (không commit), nên số version hiện ở tiêu đề cửa sổ và trong *Properties → Details* của file exe.
+Script dùng `csc.exe` có sẵn trong `%SystemRoot%/Microsoft.NET/Framework64/v4.0.30319/`, biên dịch mọi file `.cs` trong `src/` và tạo ra `GpuToggle.exe`. Build xong chỉ cần giữ lại file `.exe`. Version lấy từ file `VERSION`: script sinh ra `src/Version.cs` (không commit), nên số version hiện ở tiêu đề cửa sổ và trong *Properties → Details* của file exe.
 
-> Mã nguồn cố ý không dùng ký tự `\`, vì ký tự này có thể bị mất khi tải file về.
+Mã nguồn chia theo trách nhiệm, mỗi file một class:
+
+| Thư mục | Nội dung |
+|---|---|
+| `src/Core` | Hằng số chuỗi, định dạng số, đường dẫn registry của app |
+| `src/Hardware` | Đọc phần cứng: danh sách GPU và bật/tắt (pnputil), DXGI, perf counter, NVML, nvidia-smi, màn hình, CPU/RAM, cảm biến nhiệt |
+| `src/Pcie` | Thông tin link PCIe, bài đo băng thông D3D11, bộ ghi PCIe monitor, xuất CSV |
+| `src/Apps` | Lựa chọn GPU cho từng app (registry của Windows Graphics settings) |
+| `src/Osd` | Đếm FPS (ETW), bộ lấy mẫu, đánh giá nghẽn, cài đặt và cửa sổ OSD |
+| `src/UI` | `MainForm` (khung cửa sổ, chuyển trang), theme, control tự vẽ, hộp thoại, và mỗi trang một class trong `src/UI/Pages` |
+
+Thêm trang mới: tạo class kế thừa `AppPage` trong `src/UI/Pages` rồi thêm vào danh sách `pages` của `MainForm`.
+
+> Mã nguồn viết theo cú pháp C# 5 (để `csc.exe` có sẵn của Windows biên dịch được), chỉ dùng ASCII và cố ý không dùng ký tự `\`, vì ký tự này có thể bị mất khi tải file về.
 
 ## Lưu ý khi dùng eGPU
 
