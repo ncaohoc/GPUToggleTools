@@ -1614,16 +1614,39 @@ namespace GpuToggle
             f.Load += delegate { Walk(f, null); };
         }
 
-        static void Walk(Control c, Dictionary<Color, Color> map)
+        // Recolors a window. All old colors are read first and only then replaced: controls and rows
+        // without their own color report their parent's, which would already be the new one (and a new
+        // color can equal an unrelated old one, e.g. dark Text == light Border).
+        static void Walk(Control root, Dictionary<Color, Color> map)
+        {
+            var colors = new List<KeyValuePair<object, Color[]>>();
+            if (map != null) Collect(root, colors);
+            Color nc;
+            foreach (var kv in colors)
+            {
+                var c = kv.Key as Control;
+                var si = kv.Key as ListViewItem.ListViewSubItem;
+                if (map.TryGetValue(kv.Value[0], out nc)) { if (c != null) c.BackColor = nc; else si.BackColor = nc; }
+                if (map.TryGetValue(kv.Value[1], out nc)) { if (c != null) c.ForeColor = nc; else si.ForeColor = nc; }
+            }
+            Style(root, map);
+        }
+
+        static void Collect(Control c, List<KeyValuePair<object, Color[]>> colors)
+        {
+            if (!(c is Button)) colors.Add(new KeyValuePair<object, Color[]>(c, new Color[] { c.BackColor, c.ForeColor }));
+            var lv = c as ListView;
+            if (lv != null)
+                foreach (ListViewItem it in lv.Items)
+                    foreach (ListViewItem.ListViewSubItem si in it.SubItems)
+                        colors.Add(new KeyValuePair<object, Color[]>(si, new Color[] { si.BackColor, si.ForeColor }));
+            foreach (Control ch in c.Controls) Collect(ch, colors);
+        }
+
+        static void Style(Control c, Dictionary<Color, Color> map)
         {
             var b = c as Button;
-            Color nc;
             if (b != null && styles.ContainsKey(b)) StyleButton(b, map);
-            else if (b == null && map != null)
-            {
-                if (map.TryGetValue(c.BackColor, out nc)) c.BackColor = nc;
-                if (map.TryGetValue(c.ForeColor, out nc)) c.ForeColor = nc;
-            }
             var cb = c as ComboBox;
             if (cb != null) { cb.FlatStyle = FlatStyle.Flat; cb.BackColor = Card; cb.ForeColor = Text; }
             var nu = c as NumericUpDown;
@@ -1632,7 +1655,7 @@ namespace GpuToggle
             if (tb != null) { tb.BackColor = Card; tb.ForeColor = Text; }
             if (c is ListView) { c.BackColor = Card; c.ForeColor = Text; }
             Native(c);
-            foreach (Control ch in c.Controls) Walk(ch, map);
+            foreach (Control ch in c.Controls) Style(ch, map);
             c.Invalidate();
         }
 
@@ -2091,6 +2114,123 @@ namespace GpuToggle
         }
     }
 
+    // Pill switch for the header: sun on the left (light), moon on the right (dark).
+    // The knob slides over the active icon.
+    class ThemeSwitch : Control
+    {
+        public bool On;              // true = dark
+        float pos;                   // knob position 0 (left) .. 1 (right), animated
+        bool hover;
+        System.Windows.Forms.Timer anim;
+        public event EventHandler Toggled;
+
+        public ThemeSwitch()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
+            Size = new Size(Ui.S(66), Ui.S(32));
+            Cursor = Cursors.Hand;
+            anim = new System.Windows.Forms.Timer();
+            anim.Interval = 15;
+            anim.Tick += delegate
+            {
+                float target = On ? 1f : 0f;
+                pos += (target - pos) * 0.35f;
+                if (Math.Abs(target - pos) < 0.02f) { pos = target; anim.Stop(); }
+                Invalidate();
+            };
+            Disposed += delegate { anim.Dispose(); };
+        }
+
+        // Sets the state without animation (initial value / theme changed elsewhere).
+        public void SetState(bool dark)
+        {
+            On = dark;
+            pos = dark ? 1f : 0f;
+            Invalidate();
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnClick(EventArgs e)
+        {
+            On = !On;
+            anim.Start();
+            if (Toggled != null) Toggled(this, EventArgs.Empty);
+            base.OnClick(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Parent != null ? Parent.BackColor : Theme.Header);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            var track = new Rectangle(0, 0, Width - 1, Height - 1);
+            using (var path = Theme.Round(track, track.Height / 2f))
+            {
+                using (var br = new SolidBrush(hover ? Theme.HeaderSel : Theme.HeaderHover)) g.FillPath(br, path);
+                using (var pen = new Pen(Theme.HeaderSel)) g.DrawPath(pen, path);
+            }
+
+            int pad = Ui.S(3);
+            int d = Height - 1 - pad * 2;                      // knob diameter
+            float travel = Width - 1 - pad * 2 - d;
+            var knob = new RectangleF(pad + travel * pos, pad, d, d);
+            float cyAll = pad + d / 2f;
+            var sunC = new PointF(pad + d / 2f, cyAll);
+            var moonC = new PointF(Width - 1 - pad - d / 2f, cyAll);
+
+            // Knob: warm for the sun, cool for the moon, blending while it slides.
+            Color kc = Blend(Color.FromArgb(253, 224, 71), Color.FromArgb(203, 213, 225), pos);
+            using (var br = new SolidBrush(kc)) g.FillEllipse(br, knob);
+
+            // Icons: the one under the knob is dark, the other one muted on the track.
+            Color onKnob = Color.FromArgb(30, 41, 59);
+            DrawSun(g, sunC, d, pos < 0.5f ? onKnob : Theme.HeaderMuted);
+            DrawMoon(g, moonC, d, pos >= 0.5f ? onKnob : Theme.HeaderMuted, pos >= 0.5f ? kc : (hover ? Theme.HeaderSel : Theme.HeaderHover));
+        }
+
+        static Color Blend(Color a, Color b, float t)
+        {
+            return Color.FromArgb((int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
+        }
+
+        static void DrawSun(Graphics g, PointF c, int d, Color col)
+        {
+            float r = d * 0.17f, r1 = d * 0.27f, r2 = d * 0.38f;
+            using (var br = new SolidBrush(col)) g.FillEllipse(br, c.X - r, c.Y - r, r * 2, r * 2);
+            using (var pen = new Pen(col, Math.Max(1.2f, d * 0.065f)))
+            {
+                pen.StartCap = pen.EndCap = LineCap.Round;
+                for (int i = 0; i < 8; i++)
+                {
+                    double a = i * Math.PI / 4;
+                    g.DrawLine(pen, c.X + (float)Math.Cos(a) * r1, c.Y + (float)Math.Sin(a) * r1,
+                        c.X + (float)Math.Cos(a) * r2, c.Y + (float)Math.Sin(a) * r2);
+                }
+            }
+        }
+
+        // Crescent: a disc with an offset disc cut out of it.
+        static void DrawMoon(Graphics g, PointF c, int d, Color col, Color bg)
+        {
+            float r = d * 0.30f;
+            using (var disc = new GraphicsPath())
+            using (var cut = new GraphicsPath())
+            {
+                disc.AddEllipse(c.X - r, c.Y - r, r * 2, r * 2);
+                cut.AddEllipse(c.X - r + r * 0.75f, c.Y - r - r * 0.45f, r * 2, r * 2);
+                using (var reg = new Region(disc))
+                {
+                    reg.Exclude(cut);
+                    using (var br = new SolidBrush(col)) g.FillRegion(br, reg);
+                }
+            }
+        }
+    }
+
     partial class MainForm : Form
     {
         const int RevertSeconds = 15;
@@ -2103,7 +2243,8 @@ namespace GpuToggle
         StyledList list, dispList, appsList;
         Button btnEnable, btnDisable, btnRefresh, btnPcie;
         Button btnAddApp, btnAddRunning, btnRemoveApp, btnLaunch, btnGfxSettings, btnPrefAuto, btnPrefSave, btnPrefPerf;
-        Button navGpus, navApps, navMon, navOsd, navTheme;
+        Button navGpus, navApps, navMon, navOsd;
+        ThemeSwitch themeSwitch;
         int curPage;
         Panel gpuPage, appsPage, monitorPage, header;
         // PCIe monitor page
@@ -2131,7 +2272,7 @@ namespace GpuToggle
 
         public MainForm()
         {
-            Text = "GPU Toggle";
+            Text = "GPU Toggle v" + AppVersion.Text;
             Font = Theme.Regular;
             BackColor = Theme.Surface;
             ForeColor = Theme.Text;
@@ -2273,6 +2414,10 @@ namespace GpuToggle
                 }
                 var flags = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
                 TextRenderer.DrawText(g, "GPU Toggle", Theme.Title, new Point(x, Ui.S(12)), Color.White, flags);
+                int tw = TextRenderer.MeasureText(g, "GPU Toggle", Theme.Title, Size.Empty, flags).Width;
+                var tsz = TextRenderer.MeasureText(g, "v", Theme.Title, Size.Empty, flags);
+                var vsz = TextRenderer.MeasureText(g, "v", Theme.Small, Size.Empty, flags);
+                TextRenderer.DrawText(g, "v" + AppVersion.Text, Theme.Small, new Point(x + tw + Ui.S(8), Ui.S(12) + tsz.Height - vsz.Height - Ui.S(3)), Theme.HeaderMuted, flags);
                 TextRenderer.DrawText(g, "Enable / disable GPUs for eGPU setups and choose which GPU each game uses",
                     Theme.Small, new Point(x + Ui.S(1), Ui.S(44)), Theme.HeaderMuted, flags);
             };
@@ -2293,22 +2438,22 @@ namespace GpuToggle
             navOsd = MakeNav("OSD");
             navOsd.Width = Ui.S(84);
             navOsd.Click += delegate { ShowPage(3); };
-            navTheme = MakeNav("");
-            navTheme.Width = Ui.S(104);
-            navTheme.Margin = new Padding(Ui.S(14), 0, 0, 0);
-            navTheme.Click += delegate
+            // Light / dark switch. Until it is clicked the app follows the Windows setting.
+            themeSwitch = new ThemeSwitch();
+            themeSwitch.Margin = new Padding(Ui.S(16), Ui.S(2), 0, 0);
+            themeSwitch.SetState(Theme.Dark);
+            new ToolTip().SetToolTip(themeSwitch, "Light / dark mode");
+            themeSwitch.Toggled += delegate
             {
-                // Auto (follow Windows) -> Light -> Dark -> Auto
-                Theme.Mode = Theme.Mode == "system" ? "light" : (Theme.Mode == "light" ? "dark" : "system");
+                Theme.Mode = themeSwitch.On ? "dark" : "light";
                 Theme.SaveMode();
-                Theme.Retheme(Theme.WantDark);
-                StyleNav();
+                Theme.Retheme(themeSwitch.On);
             };
             nav.Controls.Add(navGpus);
             nav.Controls.Add(navApps);
             nav.Controls.Add(navMon);
             nav.Controls.Add(navOsd);
-            nav.Controls.Add(navTheme);
+            nav.Controls.Add(themeSwitch);
             header.Controls.Add(nav);
 
             Theme.Changed += delegate { StyleNav(); };
@@ -2339,10 +2484,10 @@ namespace GpuToggle
             return b;
         }
 
-        // Header buttons: selected page highlighted; theme button shows the current mode.
+        // Header buttons: selected page highlighted; theme switch follows the current palette.
         void StyleNav()
         {
-            Button[] navs = { navGpus, navApps, navMon, navOsd, navTheme };
+            Button[] navs = { navGpus, navApps, navMon, navOsd };
             for (int i = 0; i < navs.Length; i++)
             {
                 bool sel = i == curPage;
@@ -2351,8 +2496,9 @@ namespace GpuToggle
                 navs[i].FlatAppearance.MouseOverBackColor = Theme.HeaderHover;
                 navs[i].FlatAppearance.MouseDownBackColor = Theme.HeaderSel;
             }
-            navTheme.Text = Theme.Mode == "system" ? "Theme: Auto" : (Theme.Mode == "dark" ? "Theme: Dark" : "Theme: Light");
-            if (navTheme.Parent != null) navTheme.Parent.BackColor = Theme.Header;
+            if (themeSwitch.On != Theme.Dark) themeSwitch.SetState(Theme.Dark);   // e.g. Windows switched while on Auto
+            if (themeSwitch.Parent != null) themeSwitch.Parent.BackColor = Theme.Header;
+            themeSwitch.Invalidate();
             header.BackColor = Theme.Header;
             header.Invalidate();
         }

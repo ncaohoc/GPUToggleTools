@@ -24,6 +24,7 @@ namespace GpuToggle
         public double Fps, FrameMs;
         public double Low1;      // "1 % low" FPS over the last 10 s, 0 until there are enough frames
         public string Api;
+        public float[] Graph;    // FPS over a 0.5 s window, every 0.25 s for the last ~9.5 s (oldest first, -1 = no data)
     }
 
     static class FrameCounter
@@ -273,7 +274,26 @@ namespace GpuToggle
                 long p99 = ft[(int)Math.Floor((ft.Length - 1) * 0.99)];
                 if (p99 > 0) s.Low1 = Math.Min(s.Fps, Sec / (double)p99);
             }
+            s.Graph = BuildGraph(l, last);
             return s;
+        }
+
+        public const int GraphPoints = 38;
+
+        static float[] BuildGraph(List<long> l, long end)
+        {
+            const long step = Sec / 4, win = Sec / 2;
+            var g = new float[GraphPoints];
+            int lo = 0, hi = 0;
+            for (int k = 0; k < GraphPoints; k++)
+            {
+                long e = end - (GraphPoints - 1 - k) * step, b = e - win;
+                if (b < l[0] - step) { g[k] = -1; continue; }
+                while (lo < l.Count && l[lo] <= b) lo++;
+                while (hi < l.Count && l[hi] <= e) hi++;
+                g[k] = (hi - lo) * (float)Sec / win;
+            }
+            return g;
         }
     }
 
@@ -412,6 +432,8 @@ namespace GpuToggle
         public double PcieRx = -1, PcieTx = -1;        // bytes/s, host -> GPU / GPU -> host
         public double PcieRefRx, PcieRefTx;             // what counts as 100 %
         public bool PcieMeasured;                       // refs come from the bandwidth test (else theoretical link)
+        public float[] PcieRxGraph, PcieTxGraph;        // last ~10 s, one point per snapshot (oldest first, -1 = no data)
+        public float[] GpuGraph, VramGraph, CpuGraph, CpuMaxGraph, RamGraph;
         public FrameStats Frames;
         public string FpsError;
         public int RefreshHz;
@@ -466,6 +488,9 @@ namespace GpuToggle
         string appName = "";
         GpuInfo autoGpu;
         readonly Queue<OsdSnapshot> hist = new Queue<OsdSnapshot>();
+        public const int PcieGraphPoints = 20;
+        readonly float[] pcieRxHist = NewHist(), pcieTxHist = NewHist();
+        readonly float[] gpuHist = NewHist(), vramHist = NewHist(), cpuHist = NewHist(), cpuMaxHist = NewHist(), ramHist = NewHist();
         readonly uint selfPid = (uint)Process.GetCurrentProcess().Id;
 
         public void Start()
@@ -484,6 +509,19 @@ namespace GpuToggle
             if (thread != null) { thread.Join(1500); thread = null; }
             lock (snapLock) latest = null;
             hist.Clear();
+            ClearGpuHist();
+            ClearHist(cpuHist); ClearHist(cpuMaxHist); ClearHist(ramHist);
+        }
+
+        void ClearGpuHist() { ClearHist(pcieRxHist); ClearHist(pcieTxHist); ClearHist(gpuHist); ClearHist(vramHist); }
+
+        static float[] NewHist() { var a = new float[PcieGraphPoints]; ClearHist(a); return a; }
+        static void ClearHist(float[] a) { for (int i = 0; i < a.Length; i++) a[i] = -1; }
+        static float[] Push(float[] a, double v)
+        {
+            Array.Copy(a, 1, a, 0, a.Length - 1);
+            a[a.Length - 1] = (float)v;
+            return (float[])a.Clone();
         }
 
         void Loop()
@@ -563,7 +601,7 @@ namespace GpuToggle
             }
 
             var now = CurrentGpu();
-            if (now != gpu) { sumRx = sumTx = 0; nPcie = 0; gpu = now; h = NvmlHandle(gpu); }
+            if (now != gpu) { sumRx = sumTx = 0; nPcie = 0; gpu = now; h = NvmlHandle(gpu); ClearGpuHist(); }
             if (gpu != null)
             {
                 s.GpuName = gpu.Name;
@@ -590,6 +628,13 @@ namespace GpuToggle
                 PcieRefs(gpu, h, tick, s);
             }
             if (nPcie > 0) { s.PcieRx = sumRx / nPcie; s.PcieTx = sumTx / nPcie; }
+            s.PcieRxGraph = Push(pcieRxHist, s.PcieRx);
+            s.PcieTxGraph = Push(pcieTxHist, s.PcieTx);
+            s.GpuGraph = Push(gpuHist, s.GpuLoad);
+            s.VramGraph = Push(vramHist, s.VramPct);
+            s.CpuGraph = Push(cpuHist, s.CpuLoad);
+            s.CpuMaxGraph = Push(cpuMaxHist, s.CpuMaxCore);
+            s.RamGraph = Push(ramHist, s.RamPct);
             sumRx = sumTx = 0;
             nPcie = 0;
 
@@ -749,6 +794,7 @@ namespace GpuToggle
     {
         public const int ItemFps = 1, ItemGpu = 2, ItemVram = 4, ItemCpu = 8, ItemRam = 16, ItemPcie = 32, ItemLimit = 64;
         public static int Corner = 0, TextSize = 1, Alpha = 70, Items = 127;
+        public static int Graphs = ItemFps | ItemPcie;   // which rows also draw a small graph (same bits as Items)
         public static string Gpu = "auto";
 
         static string Key { get { return "Software" + Txt.BS + "GPUToggle"; } }
@@ -764,6 +810,7 @@ namespace GpuToggle
                     TextSize = Clamp(k.GetValue("OsdSize"), 0, 2, TextSize);
                     Alpha = Clamp(k.GetValue("OsdBackground"), 0, 100, Alpha);
                     Items = Clamp(k.GetValue("OsdItems"), 0, 127, Items);
+                    Graphs = Clamp(k.GetValue("OsdGraphs"), 0, 63, Graphs);
                     string g = k.GetValue("OsdGpu") as string;
                     if (!string.IsNullOrEmpty(g)) Gpu = g;
                 }
@@ -786,6 +833,7 @@ namespace GpuToggle
                     k.SetValue("OsdSize", TextSize, RegistryValueKind.DWord);
                     k.SetValue("OsdBackground", Alpha, RegistryValueKind.DWord);
                     k.SetValue("OsdItems", Items, RegistryValueKind.DWord);
+                    k.SetValue("OsdGraphs", Graphs, RegistryValueKind.DWord);
                     k.SetValue("OsdGpu", Gpu, RegistryValueKind.String);
                 }
             }
@@ -799,7 +847,13 @@ namespace GpuToggle
     {
         public string Text;
         public Color Color;
+        public float[] Graph;    // when set, a small line graph is drawn over the width of Text instead of the text
+        public float[] Graph2;   // optional second series on the same scale
+        public Color Color2;
+        public float Floor;      // the scale never goes below this, so idle noise stays flat
+        public float Fixed;      // when > 0 the scale is exactly 0..Fixed (percentages)
         public OsdSeg(string text, Color color) { Text = text; Color = color; }
+        public OsdSeg(float[] graph, int chars, Color color) { Graph = graph; Text = new string(' ', chars); Color = color; }
     }
 
     // Layered, click-through, topmost tool window drawn with per-pixel alpha (UpdateLayeredWindow).
@@ -900,7 +954,8 @@ namespace GpuToggle
                             float x = pad;
                             foreach (var seg in line)
                             {
-                                if (seg.Text.Trim().Length > 0)
+                                if (seg.Graph != null) DrawGraph(g, seg, x, y);
+                                else if (seg.Text.Trim().Length > 0)
                                 {
                                     g.DrawString(seg.Text, font, shadow, x + 1, y + 1, sf);
                                     using (var br = new SolidBrush(seg.Color)) g.DrawString(seg.Text, font, br, x, y, sf);
@@ -945,6 +1000,42 @@ namespace GpuToggle
             SetWindowPos(Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10);   // HWND_TOPMOST, NOSIZE | NOMOVE | NOACTIVATE
         }
 
+        // Sparkline inside one text row: area + line, scaled 0..max, with the last ~10 s of FPS.
+        void DrawGraph(Graphics g, OsdSeg seg, float x, float y)
+        {
+            float gx = x + cw * 0.5f, gw = seg.Text.Length * cw - cw, gy = y + lh * 0.14f, gh = lh * 0.68f;
+            float max = Math.Max(1e-6f, seg.Floor);
+            foreach (float f in seg.Graph) max = Math.Max(max, f);
+            if (seg.Graph2 != null) foreach (float f in seg.Graph2) max = Math.Max(max, f);
+            max *= 1.1f;
+            if (seg.Fixed > 0) max = seg.Fixed;
+            using (var bg = new SolidBrush(Color.FromArgb(50, 255, 255, 255)))
+                g.FillRectangle(bg, gx, gy, gw, gh);
+            if (seg.Graph2 != null) DrawSeries(g, seg.Graph2, seg.Color2, max, gx, gy, gw, gh);
+            DrawSeries(g, seg.Graph, seg.Color, max, gx, gy, gw, gh);
+        }
+
+        void DrawSeries(Graphics g, float[] v, Color color, float max, float gx, float gy, float gw, float gh)
+        {
+            var pts = new List<PointF>();
+            for (int k = 0; k < v.Length; k++)
+            {
+                if (v[k] < 0) continue;
+                pts.Add(new PointF(gx + gw * k / (v.Length - 1), gy + gh - gh * Math.Min(1f, v[k] / max)));
+            }
+            if (pts.Count < 2) return;
+            var area = new List<PointF>(pts);
+            area.Add(new PointF(pts[pts.Count - 1].X, gy + gh));
+            area.Add(new PointF(pts[0].X, gy + gh));
+            using (var fill = new SolidBrush(Color.FromArgb(60, color)))
+                g.FillPolygon(fill, area.ToArray());
+            using (var pen = new Pen(color, Math.Max(1f, lh / 14f)))
+            {
+                pen.LineJoin = LineJoin.Round;
+                g.DrawLines(pen, pts.ToArray());
+            }
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing && font != null) font.Dispose();
@@ -973,6 +1064,7 @@ namespace GpuToggle
         System.Windows.Forms.Timer osdTimer;
 
         // OSD colors (fixed: the overlay sits on top of the game, not on the app theme)
+        static readonly Color OsdGraph = Color.FromArgb(90, 200, 250), OsdGraph2 = Color.FromArgb(240, 120, 200);
         static readonly Color OsdLabel = Color.FromArgb(255, 170, 70), OsdValue = Color.FromArgb(245, 247, 250), OsdDim = Color.FromArgb(160, 170, 185),
             OsdGood = Color.FromArgb(110, 220, 130), OsdWarn = Color.FromArgb(255, 180, 60), OsdBad = Color.FromArgb(255, 90, 90);
 
@@ -1073,6 +1165,30 @@ namespace GpuToggle
                 bar2.Controls.Add(cb);
             }
 
+            var bar3 = Theme.Toolbar();
+            var lblGraph = OsdLabelCtl("Graph next to:");
+            lblGraph.Margin = new Padding(0, Ui.S(4), Ui.S(10), Ui.S(6));
+            bar3.Controls.Add(lblGraph);
+            string[] gnames = { "FPS", "GPU load", "VRAM", "CPU", "RAM", "PCIe up / down" };
+            for (int i = 0; i < gnames.Length; i++)
+            {
+                int bit = 1 << i;
+                var cb = new CheckBox();
+                cb.Text = gnames[i];
+                cb.AutoSize = true;
+                cb.ForeColor = Theme.Text;
+                cb.BackColor = Theme.Surface;
+                cb.Checked = (OsdSettings.Graphs & bit) != 0;
+                cb.Margin = new Padding(0, Ui.S(4), Ui.S(14), Ui.S(6));
+                cb.CheckedChanged += delegate
+                {
+                    if (cb.Checked) OsdSettings.Graphs |= bit; else OsdSettings.Graphs &= ~bit;
+                    OsdSettings.Save();
+                    OsdTick();
+                };
+                bar3.Controls.Add(cb);
+            }
+
             lblOsdInfo = new Label();
             lblOsdInfo.Dock = DockStyle.Top;
             lblOsdInfo.Height = Ui.S(24);
@@ -1139,6 +1255,7 @@ namespace GpuToggle
             osdPage.Controls.Add(gap);
             osdPage.Controls.Add(cards);
             osdPage.Controls.Add(lblOsdInfo);
+            osdPage.Controls.Add(bar3);
             osdPage.Controls.Add(bar2);
             osdPage.Controls.Add(bar);
 
@@ -1238,10 +1355,19 @@ namespace GpuToggle
         static Color TempColor(float t) { return t >= 90 ? OsdBad : (t >= 80 ? OsdWarn : OsdValue); }
         static Color PctColor(double p, double warn, double bad) { return p >= bad ? OsdBad : (p >= warn ? OsdWarn : OsdValue); }
 
+        static void AddGraph(List<OsdSeg> l, float[] v, float[] v2, float fixedMax)
+        {
+            if (v == null) return;
+            var g = new OsdSeg(v, 11, OsdGraph);
+            g.Fixed = fixedMax;
+            if (v2 != null) { g.Graph2 = v2; g.Color2 = OsdGraph2; }
+            l.Add(g);
+        }
+
         List<List<OsdSeg>> OsdLines(OsdSnapshot s)
         {
             var lines = new List<List<OsdSeg>>();
-            int items = OsdSettings.Items;
+            int items = OsdSettings.Items, graphs = OsdSettings.Graphs;
             if (s == null)
             {
                 lines.Add(new List<OsdSeg> { new OsdSeg("OSD  starting...", OsdDim) });
@@ -1254,6 +1380,7 @@ namespace GpuToggle
                 if (s.Frames != null)
                 {
                     l.Add(new OsdSeg(PadL(F(s.Frames.Fps, "0"), 4), OsdValue));
+                    if ((graphs & OsdSettings.ItemFps) != 0 && s.Frames.Graph != null) l.Add(new OsdSeg(s.Frames.Graph, 11, OsdGraph));
                     l.Add(new OsdSeg(PadL(F(s.Frames.FrameMs, "0.0"), 6) + " ms", OsdDim));
                     if (s.Frames.Low1 > 0) l.Add(new OsdSeg("  1% " + F(s.Frames.Low1, "0"), s.Frames.Low1 < s.Frames.Fps * 0.5 ? OsdWarn : OsdDim));
                 }
@@ -1264,6 +1391,7 @@ namespace GpuToggle
             {
                 var l = new List<OsdSeg> { new OsdSeg("GPU  ", OsdLabel) };
                 l.Add(new OsdSeg(s.GpuLoad >= 0 ? PadL(F(s.GpuLoad, "0"), 3) + " %" : "  - %", OsdValue));
+                if ((graphs & OsdSettings.ItemGpu) != 0) AddGraph(l, s.GpuGraph, null, 100);
                 if (s.GpuTemp > 0) l.Add(new OsdSeg(PadL(F(s.GpuTemp, "0"), 5) + Deg, TempColor(s.GpuTemp)));
                 if (s.GpuPower >= 0) l.Add(new OsdSeg(PadL(F(s.GpuPower, "0"), 5) + " W", s.GpuPowerLimit > 0 && s.GpuPower >= s.GpuPowerLimit * 0.97 ? OsdWarn : OsdDim));
                 lines.Add(l);
@@ -1271,7 +1399,11 @@ namespace GpuToggle
             if ((items & OsdSettings.ItemVram) != 0)
             {
                 var l = new List<OsdSeg> { new OsdSeg("VRAM ", OsdLabel) };
-                if (s.VramTotal > 0) l.Add(new OsdSeg(Gb(s.VramUsed) + " / " + Gb(s.VramTotal) + " GB", PctColor(s.VramPct, 85, 95)));
+                if (s.VramTotal > 0)
+                {
+                    l.Add(new OsdSeg(Gb(s.VramUsed) + " / " + Gb(s.VramTotal) + " GB", PctColor(s.VramPct, 85, 95)));
+                    if ((graphs & OsdSettings.ItemVram) != 0) AddGraph(l, s.VramGraph, null, 100);
+                }
                 else l.Add(new OsdSeg("-", OsdDim));
                 lines.Add(l);
             }
@@ -1279,6 +1411,7 @@ namespace GpuToggle
             {
                 var l = new List<OsdSeg> { new OsdSeg("CPU  ", OsdLabel) };
                 l.Add(new OsdSeg(s.CpuLoad >= 0 ? PadL(F(s.CpuLoad, "0"), 3) + " %" : "  - %", OsdValue));
+                if ((graphs & OsdSettings.ItemCpu) != 0) AddGraph(l, s.CpuGraph, s.CpuMaxGraph, 100);   // total + busiest core
                 if (s.CpuMaxCore >= 0) l.Add(new OsdSeg("  max " + PadL(F(s.CpuMaxCore, "0"), 3) + " %", PctColor(s.CpuMaxCore, 85, 95)));
                 if (s.CpuTemp > 0) l.Add(new OsdSeg(PadL(F(s.CpuTemp, "0"), 5) + Deg, TempColor(s.CpuTemp)));
                 lines.Add(l);
@@ -1286,7 +1419,11 @@ namespace GpuToggle
             if ((items & OsdSettings.ItemRam) != 0)
             {
                 var l = new List<OsdSeg> { new OsdSeg("RAM  ", OsdLabel) };
-                if (s.RamTotal > 0) l.Add(new OsdSeg(Gb(s.RamUsed) + " / " + Gb(s.RamTotal) + " GB", PctColor(s.RamPct, 85, 92)));
+                if (s.RamTotal > 0)
+                {
+                    l.Add(new OsdSeg(Gb(s.RamUsed) + " / " + Gb(s.RamTotal) + " GB", PctColor(s.RamPct, 85, 92)));
+                    if ((graphs & OsdSettings.ItemRam) != 0) AddGraph(l, s.RamGraph, null, 100);
+                }
                 else l.Add(new OsdSeg("-", OsdDim));
                 lines.Add(l);
             }
@@ -1295,7 +1432,16 @@ namespace GpuToggle
                 var l = new List<OsdSeg> { new OsdSeg("PCIe ", OsdLabel) };
                 if (s.PcieRx >= 0)
                 {
-                    l.Add(new OsdSeg(((char)0x2191).ToString() + F(s.PcieRx / 1e9, "0.00") + " " + ((char)0x2193).ToString() + F(s.PcieTx / 1e9, "0.00") + " GB/s", OsdValue));
+                    l.Add(new OsdSeg(((char)0x2191).ToString(), OsdGraph));
+                    l.Add(new OsdSeg(F(s.PcieRx / 1e9, "0.00") + " ", OsdValue));
+                    l.Add(new OsdSeg(((char)0x2193).ToString(), OsdGraph2));
+                    l.Add(new OsdSeg(F(s.PcieTx / 1e9, "0.00") + " GB/s", OsdValue));
+                    if ((graphs & OsdSettings.ItemPcie) != 0 && s.PcieRxGraph != null)
+                    {
+                        var gs = new OsdSeg(s.PcieRxGraph, 11, OsdGraph);
+                        gs.Graph2 = s.PcieTxGraph; gs.Color2 = OsdGraph2; gs.Floor = 0.1e9f;
+                        l.Add(gs);
+                    }
                     double p = s.PciePct;
                     if (p >= 0) l.Add(new OsdSeg(PadL(F(p, "0"), 5) + " %", PctColor(p, 70, s.PcieMeasured ? 90 : 85)));
                 }

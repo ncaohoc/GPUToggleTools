@@ -4,6 +4,8 @@ Công cụ WinForms nhỏ giúp **bật/tắt nhanh GPU khi dùng eGPU**: ví d�
 
 ![icon](app.ico)
 
+**Tải về:** [GpuToggle.exe bản mới nhất](https://github.com/ncaohoc/GPUToggleTools/releases/latest/download/GpuToggle.exe). Các bản cũ và ghi chú thay đổi nằm ở trang [Releases](https://github.com/ncaohoc/GPUToggleTools/releases). Tải xong mở luôn, không cần cài đặt.
+
 ## Giao diện
 
 Cửa sổ có thanh tiêu đề màu navy kèm logo, và 4 trang chuyển qua lại bằng nút trên thanh tiêu đề:
@@ -12,7 +14,7 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 4 trang chuyển qua l
 - **Apps / Games**: chọn GPU cho từng game hoặc ứng dụng nặng (xem bên dưới).
 - **PCIe monitor**: đồ thị băng thông PCIe thời gian thực khi chơi game, kèm nhật ký những lần bị nghẽn.
 - **OSD**: lớp thông số hiện đè lên game (FPS, GPU, VRAM, CPU, RAM, PCIe) và cho biết cái gì đang giới hạn FPS.
-- **Dark mode**: nút **Theme** ở góc phải thanh tiêu đề đổi lần lượt *Auto* (theo cài đặt sáng/tối của Windows) → *Light* → *Dark*. Đổi ngay không cần mở lại app, lựa chọn được lưu lại (`HKCU/Software/GPUToggle`).
+- **Dark mode**: công tắc mặt trời / mặt trăng ở góc phải thanh tiêu đề. Lúc chưa bấm, app theo chế độ sáng/tối của Windows; đã bấm thì app nhớ lựa chọn (`HKCU/Software/GPUToggle`). Đổi ngay không cần mở lại app.
 
 ## Tính năng
 
@@ -63,6 +65,10 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 4 trang chuyển qua l
   - **RAM**: dung lượng đã dùng / tổng.
   - **PCIe**: lưu lượng ↑ Host -> GPU và ↓ GPU -> Host (GB/s), kèm % so với giới hạn đo thực tế (chỉ card NVIDIA).
   - **LIM**: thứ đang giới hạn FPS, tính trung bình 3 giây gần nhất.
+- **Graph next to**: bật/tắt đồ thị nhỏ (~10 giây gần nhất) nằm ngay trong hàng cho từng thông số. Mặc định bật cho FPS và PCIe.
+  - FPS: đồ thị tự co giãn theo FPS cao nhất, nên lần tụt FPS hay khựng hình hiện thành một cái hố.
+  - GPU / VRAM / RAM: thang cố định 0 – 100 %. CPU: xanh là tải tổng, hồng là luồng bận nhất.
+  - PCIe: xanh là ↑ Host -> GPU, hồng là ↓ GPU -> Host, chung một thang.
 - Chọn được GPU cần theo dõi. Mặc định **Auto** là card mà game ở cửa sổ trước đang chạy. Chọn được góc màn hình, cỡ chữ và độ đậm của nền. Mọi lựa chọn được lưu lại.
 - Trang OSD hiện các thẻ số liệu giống hệt OSD, cộng thêm thẻ **What limits the FPS** giải thích chi tiết:
 
@@ -104,13 +110,29 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 4 trang chuyển qua l
 
 ## Build
 
-Không cần Visual Studio hay .NET SDK. Để các file `GpuToggle.cs`, `Osd.cs`, `app.manifest`, `app.ico`, `build.bat` chung một thư mục rồi chạy:
+Không cần Visual Studio hay .NET SDK. Để các file `GpuToggle.cs`, `Osd.cs`, `VERSION`, `app.manifest`, `app.ico`, `build.bat` chung một thư mục rồi chạy:
 
 ```bat
 build.bat
 ```
 
-Script dùng `csc.exe` có sẵn trong `%SystemRoot%/Microsoft.NET/Framework64/v4.0.30319/` và tạo ra `GpuToggle.exe`. Build xong chỉ cần giữ lại file `.exe`.
+Script dùng `csc.exe` có sẵn trong `%SystemRoot%/Microsoft.NET/Framework64/v4.0.30319/` và tạo ra `GpuToggle.exe`. Build xong chỉ cần giữ lại file `.exe`. Version lấy từ file `VERSION`: script sinh ra `Version.cs` (không commit), nên số version hiện ở tiêu đề cửa sổ và trong *Properties → Details* của file exe.
+
+### Phát hành bản mới (release)
+
+```bat
+powershell -ExecutionPolicy Bypass -File release.ps1
+```
+
+Script `release.ps1` làm trọn một lần phát hành:
+
+1. Kiểm tra đang ở `main`, không còn thay đổi chưa commit, không bị tụt so với `origin/main`, và `gh` đã đăng nhập.
+2. Tăng version trong `VERSION`: mặc định tăng bản vá `1.2.3 → 1.2.4`. Dùng `-Bump minor` để tăng thành `1.3.0`, `-Bump major` để tăng thành `2.0.0`, hoặc `-Version 2.0.0` để đặt số cụ thể. Nếu số trong `VERSION` chưa phát hành lần nào, script dùng luôn số đó.
+3. Build, rồi đóng gói vào thư mục `release/` (`GpuToggle.exe` và `GpuToggle-vX.Y.Z.zip`).
+4. Commit `Release vX.Y.Z`, tạo tag `vX.Y.Z`, push `main` và tag.
+5. Tạo GitHub Release, đính kèm exe và zip. Ghi chú thay đổi lấy từ các commit kể từ bản trước, hoặc tự viết bằng `-Notes "..."`. Thêm `-Draft` nếu muốn xem lại trước khi công khai.
+
+Thêm `-DryRun` để chỉ tăng version, build và đóng gói thử, không commit hay push gì. Link tải ở đầu README luôn trỏ tới exe của bản mới nhất.
 
 > Mã nguồn cố ý không dùng ký tự `\`, vì ký tự này có thể bị mất khi tải file về.
 
