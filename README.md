@@ -11,6 +11,7 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 3 trang chuyển qua l
 - **GPUs**: bảng card đồ họa và bảng màn hình. Trạng thái hiện dạng nhãn màu (xanh = Enabled, xám = Disabled, đỏ = Error), cột Load có thanh tải.
 - **Apps / Games**: chọn GPU cho từng game hoặc ứng dụng nặng (xem bên dưới).
 - **PCIe monitor**: đồ thị băng thông PCIe thời gian thực khi chơi game, kèm nhật ký những lần bị nghẽn.
+- **Dark mode**: nút **Theme** ở góc phải thanh tiêu đề đổi lần lượt *Auto* (theo cài đặt sáng/tối của Windows) → *Light* → *Dark*. Đổi ngay không cần mở lại app, lựa chọn được lưu lại (`HKCU/Software/GPUToggle`).
 
 ## Tính năng
 
@@ -35,16 +36,17 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 3 trang chuyển qua l
 
 ### Theo dõi PCIe khi chơi game (trang PCIe monitor, chỉ card NVIDIA)
 
-- Bấm **Start recording** rồi mở game. App đọc lưu lượng PCIe 4 lần mỗi giây qua NVML (`nvml.dll`, có sẵn trong driver NVIDIA), kể cả khi cửa sổ app bị thu nhỏ.
+- Bấm **Start recording** rồi mở game. Nếu card chưa được đo băng thông thực tế, app bắt chạy bài đo trước (vài giây) rồi mới bắt đầu ghi. App đọc lưu lượng PCIe 4 lần mỗi giây qua NVML (`nvml.dll`, có sẵn trong driver NVIDIA), kể cả khi cửa sổ app bị thu nhỏ.
 - **Đồ thị thời gian thực** 2 phút gần nhất cho 2 chiều upload / download, tính theo % giới hạn link. Vùng tô đỏ là lúc bị nghẽn.
 - Các thẻ số liệu:
+  - **Link limit**: băng thông đo thực tế (GB/s và % của link) cạnh băng thông lý thuyết = tốc độ mỗi lane của chuẩn PCIe đang chạy × số lane, ví dụ Gen4 x4 = 1,97 × 4 = 7,88 GB/s.
   - **Now**: lưu lượng hiện tại.
   - **Average**: lưu lượng trung bình cả phiên.
   - **Peak**: lưu lượng cao nhất, kèm thời điểm đạt được.
   - **Bottleneck time**: tổng thời gian nghẽn, bao nhiêu % thời lượng phiên và số lần nghẽn.
 - **Bottleneck log**: ghi lại mọi lần nghẽn dài từ 0,5 giây trở lên, gồm giờ bắt đầu, thời lượng, chiều nghẽn, mức đỉnh và ứng dụng đang mở ở cửa sổ trước.
-- Ngưỡng nghẽn mặc định là 80 % giới hạn link, chỉnh được.
-- **Measure limit...** chạy bài đo băng thông để lấy giới hạn thật làm mốc 100 %, nên làm một lần trước khi ghi. Nếu chưa đo, app dùng băng thông lý thuyết của link. Trong lúc bài đo chạy, app tạm dừng ghi.
+- Mốc 100 % là băng thông lý thuyết của link. Ngưỡng nghẽn được tự hạ xuống đúng mức đo thực tế, ví dụ eGPU Gen4 x4 qua USB4 đo được 3,8 GB/s trên 7,9 GB/s lý thuyết thì ngưỡng là 48 %. Vẫn chỉnh tay được.
+- **Measure limit...** chạy lại bài đo và đặt lại ngưỡng nghẽn theo kết quả mới. Trong lúc bài đo chạy, app tạm dừng ghi.
 - **Export CSV...** xuất file CSV gồm số liệu tổng hợp, danh sách các lần nghẽn và toàn bộ mẫu đo theo thời gian.
 
 > NVML đếm lưu lượng thô trên link của card, có cả phần overhead của giao thức, nên con số GB/s ở đây thường cao hơn kết quả bài đo. Hãy xem cột % để đánh giá mức nghẽn. Card AMD/Intel không cho ứng dụng đọc bộ đếm lưu lượng PCIe, nên với các card này chỉ dùng được bài đo băng thông.

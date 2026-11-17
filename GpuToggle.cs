@@ -709,7 +709,7 @@ namespace GpuToggle
         public List<PcieLink> Chain = new List<PcieLink>();       // links at idle
         public List<PcieLink> ChainLoad;                           // links sampled while the test was running
         public string Tunnel;                                      // USB4 / Thunderbolt controller above the GPU, if any
-        public double NvmlRxPeak, NvmlTxPeak;                      // NVML counter peaks (bytes/s) during the test = 100 % for the live monitor
+        public double NvmlRxPeak, NvmlTxPeak;                      // NVML counter peaks (bytes/s) during the test (informational)
         public bool Integrated;
     }
 
@@ -921,7 +921,7 @@ namespace GpuToggle
                 c.Unmap(c.Ctx_, up, 0);
 
                 // While traffic flows: re-read the link (GPUs lower its speed when idle) and, on NVIDIA,
-                // record the NVML counter peaks so the live monitor knows what "100 %" looks like.
+                // record the NVML counter peaks.
                 int phase = 1;   // 1 = upload, 2 = download, 0 = done
                 IntPtr nv = IntPtr.Zero;
                 try { nv = Nvml.Find(g.VenId, g.DevId); } catch { }
@@ -1001,6 +1001,8 @@ namespace GpuToggle
         public double CapRx, CapTx;            // bytes/s that count as 100 %
         public string CapSource = "";
         public double ThresholdPct = 80;
+        public double MeasRx, MeasTx;          // bytes/s the bandwidth test reached (0 = not measured)
+        public int CapGen, CapLanes;           // link the theoretical bandwidth comes from (current gen x lanes in use)
         public GpuInfo Gpu;
         public string Error;
 
@@ -1040,35 +1042,37 @@ namespace GpuToggle
             return true;
         }
 
-        // 100 % = NVML peaks from the last bandwidth test, otherwise the theoretical link bandwidth.
+        // 100 % = theoretical bandwidth of the link. The bottleneck threshold is not a fixed % of it:
+        // after a bandwidth test it is lowered to what the link really delivered (e.g. a Gen4 x4 eGPU
+        // behind a USB4 tunnel tops out near 49 %), because traffic can never get above that.
         public void UpdateCapacity()
         {
+            CapRx = CapTx = MeasRx = MeasTx = 0;
+            CapGen = CapLanes = 0;
+            CapSource = "theoretical link";
             if (Gpu == null) return;
             BandwidthResult r;
-            if (D3D11Bandwidth.LastResults.TryGetValue(Gpu.InstanceId, out r) && r.NvmlRxPeak > 0 && r.NvmlTxPeak > 0)
+            bool have = D3D11Bandwidth.LastResults.TryGetValue(Gpu.InstanceId, out r) && r.UploadGBs > 0 && r.DownloadGBs > 0;
+            List<PcieLink> chain = null;
+            if (have) chain = r.ChainLoad != null && r.ChainLoad.Count > 0 && r.ChainLoad[0] != null ? r.ChainLoad : r.Chain;
+            try { if (chain == null || chain.Count == 0 || chain[0] == null) chain = Pcie.Chain(Gpu.InstanceId); } catch { }
+            if (chain != null && chain.Count > 0 && chain[0] != null) { CapRx = CapTx = chain[0].CurGBs * 1e9; CapGen = chain[0].CurSpeed; CapLanes = chain[0].CurWidth; }
+            if (have)
             {
-                CapRx = r.NvmlRxPeak; CapTx = r.NvmlTxPeak;
-                CapSource = "measured by the bandwidth test";
-                return;
+                MeasRx = r.UploadGBs * 1e9; MeasTx = r.DownloadGBs * 1e9;
+                // Integrated GPU / no link info: the measured speed itself is the only reference.
+                if (CapRx <= 0) CapRx = CapTx = Math.Max(MeasRx, MeasTx);
+                CapRx = Math.Max(CapRx, MeasRx); CapTx = Math.Max(CapTx, MeasTx);
+                ThresholdPct = Math.Floor(Math.Min(MeasRx / CapRx, MeasTx / CapTx) * 100);
             }
-            // Theoretical bandwidth of the current link. GPUs downclock the link when idle, so the
-            // sampling loop raises this as soon as it sees a faster link under load.
-            CapRx = CapTx = 0;
-            try
-            {
-                var chain = Pcie.Chain(Gpu.InstanceId);
-                if (chain.Count > 0 && chain[0] != null) CapRx = CapTx = chain[0].CurGBs * 1e9;
-            }
-            catch { }
-            if (CapRx <= 0) CapRx = CapTx = 1e9;
-            CapSource = "theoretical link";
+            else if (CapRx <= 0) CapRx = CapTx = 1e9;
         }
 
-        bool Measured { get { return CapSource.StartsWith("measured", StringComparison.Ordinal); } }
+        public bool Measured { get { return MeasRx > 0 && MeasTx > 0; } }
 
         public void Start()
         {
-            if (running || handle == IntPtr.Zero) return;
+            if (running || handle == IntPtr.Zero || !Measured) return;
             running = true;
             lastTime = DateTime.MinValue;
             lock (Lock) { if (Samples.Count == 0) Started = DateTime.Now; }
@@ -1126,7 +1130,7 @@ namespace GpuToggle
                     int gen = 0, width = 0;
                     try { link = Nvml.Link(handle, out gen, out width); } catch { }
                     double theo = PcieLink.LaneGBs(gen) * width * 1e9;
-                    if (!Measured && theo > CapRx) CapRx = CapTx = theo;
+                    if (!Measured && theo > CapRx) { CapRx = CapTx = theo; CapGen = gen; CapLanes = width; }   // idle links run slower; measured caps are fixed
                     linkTick = 4;
                 }
                 Add(rx, tx, link, ForegroundApp());
@@ -1458,21 +1462,157 @@ namespace GpuToggle
 
     static class Theme
     {
-        public static readonly Color Header = Color.FromArgb(15, 27, 51);
-        public static readonly Color HeaderSel = Color.FromArgb(34, 52, 92);
-        public static readonly Color HeaderHover = Color.FromArgb(26, 41, 74);
-        public static readonly Color HeaderMuted = Color.FromArgb(148, 163, 184);
-        public static readonly Color Surface = Color.FromArgb(243, 246, 250);
-        public static readonly Color Card = Color.White;
-        public static readonly Color Border = Color.FromArgb(226, 232, 240);
-        public static readonly Color Text = Color.FromArgb(30, 41, 59);
-        public static readonly Color Muted = Color.FromArgb(100, 116, 139);
-        public static readonly Color Accent = Color.FromArgb(37, 99, 235);
-        public static readonly Color Green = Color.FromArgb(22, 163, 74);
-        public static readonly Color Red = Color.FromArgb(220, 38, 38);
-        public static readonly Color Orange = Color.FromArgb(234, 88, 12);
-        public static readonly Color RowAlt = Color.FromArgb(248, 250, 252);
-        public static readonly Color RowSel = Color.FromArgb(219, 234, 254);
+        // Palette. Not readonly: SetDark swaps it and Retheme recolors the open windows.
+        public static Color Header, HeaderSel, HeaderHover, HeaderMuted, Surface, Card, Border, Text, Muted,
+            Accent, Green, Red, Orange, RowAlt, RowSel;
+        public static bool Dark;
+        public static string Mode = "system";   // "system", "light" or "dark" (saved in HKCU\Software\GPUToggle)
+        const string SettingsKey = @"Software\GPUToggle";
+
+        static Color[] Palette()
+        {
+            return new Color[] { Header, HeaderSel, HeaderHover, HeaderMuted, Surface, Card, Border, Text, Muted, Accent, Green, Red, Orange, RowAlt, RowSel };
+        }
+
+        public static void SetDark(bool dark)
+        {
+            Dark = dark;
+            Green = Color.FromArgb(22, 163, 74);
+            Red = Color.FromArgb(220, 38, 38);
+            Orange = Color.FromArgb(234, 88, 12);
+            HeaderMuted = Color.FromArgb(148, 163, 184);
+            if (!dark)
+            {
+                Header = Color.FromArgb(15, 27, 51);
+                HeaderSel = Color.FromArgb(34, 52, 92);
+                HeaderHover = Color.FromArgb(26, 41, 74);
+                Surface = Color.FromArgb(243, 246, 250);
+                Card = Color.White;
+                Border = Color.FromArgb(226, 232, 240);
+                Text = Color.FromArgb(30, 41, 59);
+                Muted = Color.FromArgb(100, 116, 139);
+                Accent = Color.FromArgb(37, 99, 235);
+                RowAlt = Color.FromArgb(248, 250, 252);
+                RowSel = Color.FromArgb(219, 234, 254);
+            }
+            else
+            {
+                Header = Color.FromArgb(8, 13, 28);
+                HeaderSel = Color.FromArgb(37, 52, 82);
+                HeaderHover = Color.FromArgb(24, 34, 56);
+                Surface = Color.FromArgb(17, 24, 39);
+                Card = Color.FromArgb(30, 39, 56);
+                Border = Color.FromArgb(55, 67, 89);
+                Text = Color.FromArgb(226, 232, 240);
+                Muted = Color.FromArgb(140, 154, 176);   // must differ from HeaderMuted (palette swap maps by value)
+                Accent = Color.FromArgb(77, 140, 255);
+                RowAlt = Color.FromArgb(36, 46, 65);
+                RowSel = Color.FromArgb(32, 62, 116);
+            }
+        }
+
+        public static bool SystemDark()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = k != null ? k.GetValue("AppsUseLightTheme") : null;
+                    return v is int && (int)v == 0;
+                }
+            }
+            catch { return false; }
+        }
+
+        public static bool WantDark { get { return Mode == "dark" || (Mode == "system" && SystemDark()); } }
+
+        public static void LoadMode()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(SettingsKey))
+                {
+                    string v = k != null ? k.GetValue("Theme") as string : null;
+                    if (v == "light" || v == "dark" || v == "system") Mode = v;
+                }
+            }
+            catch { }
+            SetDark(WantDark);
+        }
+
+        public static void SaveMode()
+        {
+            try { using (var k = Registry.CurrentUser.CreateSubKey(SettingsKey)) k.SetValue("Theme", Mode, RegistryValueKind.String); } catch { }
+        }
+
+        // ---- applying the palette to windows that are already open
+
+        [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        // Dark title bar (Windows 10 20H1+ / 11). Lists keep the default theme: the Explorer list theme
+        // draws column divider lines through the owner-drawn rows.
+        public static void Native(Control c)
+        {
+            if (!c.IsHandleCreated) return;
+            try
+            {
+                if (c is Form)
+                {
+                    int on = Dark ? 1 : 0;
+                    if (DwmSetWindowAttribute(c.Handle, 20, ref on, 4) != 0) DwmSetWindowAttribute(c.Handle, 19, ref on, 4);
+                    // Windows 11: in dark mode paint the caption like the header (overrides "accent color on
+                    // title bars"); in light mode give it back to Windows (0xFFFFFFFF = DWMWA_COLOR_DEFAULT).
+                    int cap = Dark ? ColorTranslator.ToWin32(Header) : -1, txt = Dark ? ColorTranslator.ToWin32(Color.White) : -1;
+                    DwmSetWindowAttribute(c.Handle, 35, ref cap, 4);
+                    DwmSetWindowAttribute(c.Handle, 36, ref txt, 4);
+                }
+            }
+            catch { }
+        }
+
+        // Call once in every window's constructor: themes the title bar and the native controls.
+        public static void Hook(Form f)
+        {
+            f.HandleCreated += delegate { Native(f); };
+            f.Load += delegate { Walk(f, null); };
+        }
+
+        static void Walk(Control c, Dictionary<Color, Color> map)
+        {
+            var b = c as Button;
+            Color nc;
+            if (b != null && styles.ContainsKey(b)) StyleButton(b, map);
+            else if (b == null && map != null)
+            {
+                if (map.TryGetValue(c.BackColor, out nc)) c.BackColor = nc;
+                if (map.TryGetValue(c.ForeColor, out nc)) c.ForeColor = nc;
+            }
+            var cb = c as ComboBox;
+            if (cb != null) { cb.FlatStyle = FlatStyle.Flat; cb.BackColor = Card; cb.ForeColor = Text; }
+            var nu = c as NumericUpDown;
+            if (nu != null) { nu.BackColor = Card; nu.ForeColor = Text; nu.BorderStyle = BorderStyle.FixedSingle; }
+            var tb = c as TextBox;
+            if (tb != null) { tb.BackColor = Card; tb.ForeColor = Text; }
+            if (c is ListView) { c.BackColor = Card; c.ForeColor = Text; }
+            Native(c);
+            foreach (Control ch in c.Controls) Walk(ch, map);
+            c.Invalidate();
+        }
+
+        // Switches the palette and recolors every open window in place (no restart, recordings keep running).
+        public static void Retheme(bool dark)
+        {
+            if (dark == Dark) return;
+            Color[] old = Palette();
+            SetDark(dark);
+            Color[] now = Palette();
+            var map = new Dictionary<Color, Color>();
+            for (int i = 0; i < old.Length; i++) if (!map.ContainsKey(old[i])) map[old[i]] = now[i];
+            if (Changed != null) Changed();
+            foreach (Form f in Application.OpenForms) { Walk(f, map); Native(f); f.Refresh(); }
+        }
+
+        public static event Action Changed;
 
         public static Font Regular, Semibold, SmallBold, Small, Title;
 
@@ -1503,6 +1643,35 @@ namespace GpuToggle
             return p;
         }
 
+        static Dictionary<Button, object[]> styles = new Dictionary<Button, object[]>();   // button -> { color, primary }
+
+        // Colors a MakeButton button from the current palette; map translates its stored color
+        // (e.g. Accent) when the palette changes.
+        static void StyleButton(Button b, Dictionary<Color, Color> map)
+        {
+            object[] st = styles[b];
+            Color color = (Color)st[0], nc;
+            if (map != null && map.TryGetValue(color, out nc)) { color = nc; st[0] = nc; }
+            bool primary = (bool)st[1];
+            Color bg = primary ? color : Card;
+            Color fg = primary ? Color.White : Text;
+            b.BackColor = b.Enabled ? bg : Border;
+            b.ForeColor = b.Enabled ? fg : Muted;
+            b.FlatAppearance.BorderSize = primary ? 0 : 1;
+            b.FlatAppearance.BorderColor = Border;
+            b.FlatAppearance.MouseOverBackColor = primary ? Darken(bg, 18) : (Dark ? RowAlt : Surface);
+            b.FlatAppearance.MouseDownBackColor = primary ? Darken(bg, 34) : Border;
+        }
+
+        // Changes a MakeButton button's fill color (e.g. Start recording green <-> red).
+        public static void SetButtonColor(Button b, Color color)
+        {
+            object[] st;
+            if (!styles.TryGetValue(b, out st)) { b.BackColor = color; return; }
+            st[0] = color;
+            StyleButton(b, null);
+        }
+
         // primary = filled colored button, otherwise white button with a border
         public static Button MakeButton(string text, Color color, bool primary)
         {
@@ -1517,19 +1686,10 @@ namespace GpuToggle
             b.MinimumSize = new Size(Ui.S(92), Ui.S(34));
             b.Padding = new Padding(Ui.S(10), 0, Ui.S(10), 0);
             b.Margin = new Padding(0, 0, Ui.S(8), Ui.S(8));
-            Color bg = primary ? color : Card;
-            Color fg = primary ? Color.White : Text;
-            b.BackColor = bg;
-            b.ForeColor = fg;
-            b.FlatAppearance.BorderSize = primary ? 0 : 1;
-            b.FlatAppearance.BorderColor = Border;
-            b.FlatAppearance.MouseOverBackColor = primary ? Darken(bg, 18) : Surface;
-            b.FlatAppearance.MouseDownBackColor = primary ? Darken(bg, 34) : Border;
-            b.EnabledChanged += delegate
-            {
-                b.BackColor = b.Enabled ? bg : Border;
-                b.ForeColor = b.Enabled ? fg : Muted;
-            };
+            styles[b] = new object[] { color, primary };
+            StyleButton(b, null);
+            b.EnabledChanged += delegate { StyleButton(b, null); };
+            b.Disposed += delegate { styles.Remove(b); };
             return b;
         }
 
@@ -1716,6 +1876,12 @@ namespace GpuToggle
 
         public static Color[] GpuStatusPill(string t)
         {
+            if (Theme.Dark)
+            {
+                if (t == "Enabled") return new Color[] { Color.FromArgb(20, 83, 45), Color.FromArgb(134, 239, 172) };
+                if (t == "Disabled") return new Color[] { Color.FromArgb(51, 65, 85), Color.FromArgb(148, 163, 184) };
+                return new Color[] { Color.FromArgb(127, 29, 29), Color.FromArgb(252, 165, 165) };
+            }
             if (t == "Enabled") return new Color[] { Color.FromArgb(220, 252, 231), Color.FromArgb(21, 128, 61) };
             if (t == "Disabled") return new Color[] { Color.FromArgb(241, 245, 249), Color.FromArgb(100, 116, 139) };
             return new Color[] { Color.FromArgb(254, 226, 226), Color.FromArgb(185, 28, 28) };
@@ -1723,6 +1889,12 @@ namespace GpuToggle
 
         public static Color[] PrefPill(string t)
         {
+            if (Theme.Dark)
+            {
+                if (t.StartsWith("High", StringComparison.Ordinal)) return new Color[] { Color.FromArgb(30, 58, 138), Color.FromArgb(147, 197, 253) };
+                if (t.StartsWith("Power", StringComparison.Ordinal)) return new Color[] { Color.FromArgb(120, 53, 15), Color.FromArgb(253, 230, 138) };
+                return new Color[] { Color.FromArgb(51, 65, 85), Color.FromArgb(203, 213, 225) };
+            }
             if (t.StartsWith("High", StringComparison.Ordinal)) return new Color[] { Color.FromArgb(219, 234, 254), Color.FromArgb(29, 78, 216) };
             if (t.StartsWith("Power", StringComparison.Ordinal)) return new Color[] { Color.FromArgb(254, 243, 199), Color.FromArgb(180, 83, 9) };
             return new Color[] { Color.FromArgb(241, 245, 249), Color.FromArgb(71, 85, 105) };
@@ -1735,7 +1907,7 @@ namespace GpuToggle
         public PcieMonitor Mon;
         public int WindowSeconds = 120;
         public string Message;
-        static readonly Color RxColor = Color.FromArgb(37, 99, 235);
+        static Color RxColor { get { return Theme.Accent; } }
         static readonly Color TxColor = Color.FromArgb(234, 88, 12);
 
         public PcieGraph()
@@ -1803,7 +1975,7 @@ namespace GpuToggle
                 th.DashStyle = DashStyle.Dash;
                 float y = Y(plot, thr, top);
                 g.DrawLine(th, plot.Left, y, plot.Right, y);
-                TextRenderer.DrawText(g, "bottleneck " + thr.ToString("0", Txt.Inv) + " %", Theme.Small, new Point(plot.Left + Ui.S(4), (int)y - Ui.S(16)), Theme.Red, tf);
+                TextRenderer.DrawText(g, (Mon.Measured ? "measured limit / bottleneck " : "bottleneck ") + thr.ToString("0", Txt.Inv) + " %", Theme.Small, new Point(plot.Left + Ui.S(4), (int)y - Ui.S(16)), Theme.Red, tf);
             }
 
             // Lines
@@ -1872,8 +2044,13 @@ namespace GpuToggle
             int x = Ui.S(12), w = Width - Ui.S(20);
             TextRenderer.DrawText(g, Caption.ToUpperInvariant(), Theme.SmallBold, new Rectangle(x, Ui.S(8), w, Ui.S(18)), Theme.Muted, tf);
             TextRenderer.DrawText(g, Value, Theme.Title, new Rectangle(x, Ui.S(26), w, Ui.S(30)), ValueColor, tf);
-            TextRenderer.DrawText(g, Detail, Theme.Small, new Rectangle(x, Ui.S(58), w, Height - Ui.S(60)), Theme.Muted,
-                TextFormatFlags.Left | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+            int y = Ui.S(58), lh = TextRenderer.MeasureText("Ag", Theme.Small).Height;
+            foreach (var line in (Detail ?? "").Split('\n'))
+            {
+                if (y + lh > Height - Ui.S(2)) break;
+                TextRenderer.DrawText(g, line.TrimEnd('\r'), Theme.Small, new Rectangle(x, y, w, lh), Theme.Muted, tf);
+                y += lh;
+            }
         }
     }
 
@@ -1889,15 +2066,18 @@ namespace GpuToggle
         StyledList list, dispList, appsList;
         Button btnEnable, btnDisable, btnRefresh, btnPcie;
         Button btnAddApp, btnAddRunning, btnRemoveApp, btnLaunch, btnGfxSettings, btnPrefAuto, btnPrefSave, btnPrefPerf;
-        Button navGpus, navApps, navMon;
+        Button navGpus, navApps, navMon, navTheme;
+        int curPage;
         Panel gpuPage, appsPage, monitorPage, header;
         // PCIe monitor page
         PcieMonitor mon = new PcieMonitor();
         PcieGraph graph;
+        StatCard cardLimit;
         StatCard cardNow, cardAvg, cardPeak, cardSat;
         StyledList epList;
         ComboBox cmbMonGpu;
         NumericUpDown numThr;
+        Label lblThrPct;
         Button btnMonStart, btnMonReset, btnMonMeasure, btnMonExport;
         Label lblMonInfo;
         List<GpuInfo> monGpus = new List<GpuInfo>();
@@ -1917,6 +2097,8 @@ namespace GpuToggle
             Text = "GPU Toggle";
             Font = Theme.Regular;
             BackColor = Theme.Surface;
+            ForeColor = Theme.Text;
+            Theme.Hook(this);
             ClientSize = new Size(Ui.S(1120), Ui.S(680));
             MinimumSize = new Size(Ui.S(960), Ui.S(560));
             StartPosition = FormStartPosition.CenterScreen;
@@ -2069,10 +2251,31 @@ namespace GpuToggle
             navGpus.Click += delegate { ShowPage(0); };
             navApps.Click += delegate { ShowPage(1); };
             navMon.Click += delegate { ShowPage(2); };
+            navTheme = MakeNav("");
+            navTheme.Width = Ui.S(104);
+            navTheme.Margin = new Padding(Ui.S(14), 0, 0, 0);
+            navTheme.Click += delegate
+            {
+                // Auto (follow Windows) -> Light -> Dark -> Auto
+                Theme.Mode = Theme.Mode == "system" ? "light" : (Theme.Mode == "light" ? "dark" : "system");
+                Theme.SaveMode();
+                Theme.Retheme(Theme.WantDark);
+                StyleNav();
+            };
             nav.Controls.Add(navGpus);
             nav.Controls.Add(navApps);
             nav.Controls.Add(navMon);
+            nav.Controls.Add(navTheme);
             header.Controls.Add(nav);
+
+            Theme.Changed += delegate { StyleNav(); };
+            UserPreferenceChangedEventHandler upc = delegate (object s, UserPreferenceChangedEventArgs e)
+            {
+                if (Theme.Mode == "system" && !IsDisposed)
+                    BeginInvoke((MethodInvoker)delegate { Theme.Retheme(Theme.WantDark); StyleNav(); });
+            };
+            SystemEvents.UserPreferenceChanged += upc;
+            FormClosed += delegate { SystemEvents.UserPreferenceChanged -= upc; };
         }
 
         Button MakeNav(string text)
@@ -2093,17 +2296,31 @@ namespace GpuToggle
             return b;
         }
 
+        // Header buttons: selected page highlighted; theme button shows the current mode.
+        void StyleNav()
+        {
+            Button[] navs = { navGpus, navApps, navMon, navTheme };
+            for (int i = 0; i < navs.Length; i++)
+            {
+                bool sel = i == curPage;
+                navs[i].BackColor = sel ? Theme.HeaderSel : Theme.Header;
+                navs[i].ForeColor = sel ? Color.White : Theme.HeaderMuted;
+                navs[i].FlatAppearance.MouseOverBackColor = Theme.HeaderHover;
+                navs[i].FlatAppearance.MouseDownBackColor = Theme.HeaderSel;
+            }
+            navTheme.Text = Theme.Mode == "system" ? "Theme: Auto" : (Theme.Mode == "dark" ? "Theme: Dark" : "Theme: Light");
+            if (navTheme.Parent != null) navTheme.Parent.BackColor = Theme.Header;
+            header.BackColor = Theme.Header;
+            header.Invalidate();
+        }
+
         void ShowPage(int page)
         {
+            curPage = page;
             gpuPage.Visible = page == 0;
             appsPage.Visible = page == 1;
             monitorPage.Visible = page == 2;
-            Button[] navs = { navGpus, navApps, navMon };
-            for (int i = 0; i < navs.Length; i++)
-            {
-                navs[i].BackColor = page == i ? Theme.HeaderSel : Theme.Header;
-                navs[i].ForeColor = page == i ? Color.White : Theme.HeaderMuted;
-            }
+            StyleNav();
             if (page == 1) RefreshApps();
             else if (page == 2) SetStatus("Start recording, then play your game. NVIDIA GPUs only (NVML). Shaded areas = PCIe bottleneck.");
             else SetStatus(list.Items.Count + " GPU(s) found. Double-click a row to toggle. Stats refresh every 2 s.");
@@ -2316,11 +2533,11 @@ namespace GpuToggle
             lblThr.ForeColor = Theme.Muted;
             lblThr.Margin = new Padding(Ui.S(8), Ui.S(8), Ui.S(6), 0);
             numThr = new NumericUpDown();
-            numThr.Minimum = 30; numThr.Maximum = 100; numThr.Value = 80; numThr.Increment = 5;
+            numThr.Minimum = 5; numThr.Maximum = 100; numThr.Value = 80; numThr.Increment = 5;
             numThr.Width = Ui.S(56);
             numThr.Margin = new Padding(0, Ui.S(5), Ui.S(4), 0);
             numThr.ValueChanged += delegate { mon.ThresholdPct = (double)numThr.Value; graph.Invalidate(); };
-            var lblPct = new Label();
+            var lblPct = lblThrPct = new Label();
             lblPct.Text = "% of link";
             lblPct.AutoSize = true;
             lblPct.ForeColor = Theme.Muted;
@@ -2345,20 +2562,21 @@ namespace GpuToggle
 
             var cards = new TableLayoutPanel();
             cards.Dock = DockStyle.Top;
-            cards.Height = Ui.S(100);
-            cards.ColumnCount = 4;
+            cards.Height = Ui.S(110);
+            cards.ColumnCount = 5;
             cards.RowCount = 1;
             cards.BackColor = Theme.Surface;
-            for (int i = 0; i < 4; i++) cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
+            for (int i = 0; i < 5; i++) cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, i == 0 ? 28f : 18f));
+            cardLimit = new StatCard(); cardLimit.Caption = "Link limit";
             cardNow = new StatCard(); cardNow.Caption = "Now";
             cardAvg = new StatCard(); cardAvg.Caption = "Average";
             cardPeak = new StatCard(); cardPeak.Caption = "Peak";
             cardSat = new StatCard(); cardSat.Caption = "Bottleneck time";
-            StatCard[] all = { cardNow, cardAvg, cardPeak, cardSat };
-            for (int i = 0; i < 4; i++)
+            StatCard[] all = { cardLimit, cardNow, cardAvg, cardPeak, cardSat };
+            for (int i = 0; i < all.Length; i++)
             {
                 all[i].Dock = DockStyle.Fill;
-                all[i].Margin = new Padding(i == 0 ? 0 : Ui.S(5), 0, i == 3 ? 0 : Ui.S(5), 0);
+                all[i].Margin = new Padding(i == 0 ? 0 : Ui.S(5), 0, i == all.Length - 1 ? 0 : Ui.S(5), 0);
                 cards.Controls.Add(all[i], i, 0);
             }
 
@@ -2382,7 +2600,7 @@ namespace GpuToggle
             split.Orientation = Orientation.Horizontal;
             split.BackColor = Theme.Surface;
             split.SplitterWidth = Ui.S(14);
-            split.Panel1.Controls.Add(Theme.Section("Live PCIe traffic", "Last 2 minutes, % of the link limit. Red areas = bottleneck.", Theme.CardAround(graph)));
+            split.Panel1.Controls.Add(Theme.Section("Live PCIe traffic", "Last 2 minutes, % of the theoretical link. Dashed line = measured limit, red areas = bottleneck.", Theme.CardAround(graph)));
             split.Panel2.Controls.Add(Theme.Section("Bottleneck log", "Every stretch of at least " +
                 PcieMonitor.MinEpisodeSeconds.ToString("0.0", Txt.Inv) + " s above the threshold, newest first", Theme.CardAround(epList)));
             monitorPage.Resize += delegate
@@ -2434,6 +2652,7 @@ namespace GpuToggle
             shownEpisodes = 0;
             epList.Items.Clear();
             bool ok = mon.Attach(g);
+            SyncThreshold();
             if (ok && wasRunning) mon.Start();
             UpdateMonitorUi();
         }
@@ -2444,20 +2663,51 @@ namespace GpuToggle
             else
             {
                 if (mon.Gpu == null || mon.Error != null) AttachMonitor();
-                if (mon.Error == null) mon.Start();
+                if (mon.Error != null) { UpdateMonitorUi(); return; }
+                // Bottlenecks are judged against what the link really delivers, so a measurement is required.
+                if (!mon.Measured)
+                {
+                    if (MessageBox.Show(this,
+                        "The real PCIe bandwidth of " + mon.Gpu.Name + " has not been measured yet. Real transfers never reach the theoretical link " +
+                        "(an eGPU behind a USB4 / Thunderbolt tunnel may only get half of it), so the bottleneck threshold has to come from a measurement." + Txt.NL + Txt.NL +
+                        "The bandwidth test runs now (a few seconds), the threshold is lowered to the measured % of the link, and recording starts right after it.",
+                        "Measure PCIe bandwidth first", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK)
+                        return;
+                    RunBandwidthTest(mon.Gpu, true);
+                    if (!mon.Measured) { SetStatus("Recording not started: the bandwidth was not measured."); return; }
+                }
+                mon.Start();
             }
             UpdateMonitorUi();
         }
 
+        // Shows the threshold the monitor picked for its current 100 % reference.
+        void SyncThreshold()
+        {
+            decimal v = (decimal)Math.Max((double)numThr.Minimum, Math.Min((double)numThr.Maximum, mon.ThresholdPct));
+            if (numThr.Value != v) numThr.Value = v;
+            lblThrPct.Text = "% of link";
+            graph.Invalidate();
+        }
+
         // Pauses recording while the bandwidth test runs (it would show up as a bottleneck).
-        void RunBandwidthTest(GpuInfo g)
+        void RunBandwidthTest(GpuInfo g, bool autoRun = false)
         {
             bool resume = mon.Running;
             if (resume) mon.Stop();
-            using (var dlg = new BandwidthDialog(g)) dlg.ShowDialog(this);
-            if (mon.Gpu != null && mon.Gpu.InstanceId == g.InstanceId) mon.UpdateCapacity();
+            using (var dlg = new BandwidthDialog(g, autoRun)) dlg.ShowDialog(this);
+            if (mon.Gpu != null && mon.Gpu.InstanceId == g.InstanceId) { mon.UpdateCapacity(); SyncThreshold(); }
             if (resume) mon.Start();
             UpdateMonitorUi();
+        }
+
+        // "Theoretical Gen4 x4 = 1.97 x 4 = 7.88 GB/s": per-lane speed of the current PCIe gen x lanes in use.
+        string TheoText(double cap)
+        {
+            double lane = PcieLink.LaneGBs(mon.CapGen);
+            if (lane > 0 && mon.CapLanes > 0)
+                return "Theoretical " + PcieLink.Gen(mon.CapGen) + " x" + mon.CapLanes + ": " + lane.ToString("0.00", Txt.Inv) + " x " + mon.CapLanes + " = " + Gbs(cap) + " GB/s";
+            return "Theoretical: " + Gbs(cap) + " GB/s";
         }
 
         static string Gbs(double bytesPerSec) { return (bytesPerSec / 1e9).ToString("0.00", Txt.Inv); }
@@ -2474,7 +2724,7 @@ namespace GpuToggle
             bool ok = mon.Error == null && mon.Gpu != null;
             graph.Message = mon.Gpu == null ? "No enabled GPU found." : mon.Error;
             btnMonStart.Text = mon.Running ? "Stop recording" : "Start recording";
-            btnMonStart.BackColor = mon.Running ? Theme.Red : Theme.Green;
+            Theme.SetButtonColor(btnMonStart, mon.Running ? Theme.Red : Theme.Green);
             btnMonStart.Enabled = ok;
             btnMonMeasure.Enabled = mon.Gpu != null;
 
@@ -2501,24 +2751,33 @@ namespace GpuToggle
             {
                 lblMonInfo.Text = (mon.Running ? "Recording" : (secs > 0 ? "Paused" : "Not recording")) +
                     (secs > 0 ? "  " + Dur(secs) + " (since " + started.ToString("HH:mm:ss", Txt.Inv) + ")" : "") +
-                    "   |   Link " + (last != null ? last.Link : Txt.NA) +
-                    "   |   100 % = " + Gbs(capRx) + " up / " + Gbs(capTx) + " down GB/s, " + mon.CapSource +
-                    "   |   NVML counts raw link traffic incl. protocol overhead";
+                    "   |   Link " + (last != null && mon.Running ? last.Link : (mon.CapLanes > 0 ? PcieLink.Gen(mon.CapGen) + " x" + mon.CapLanes : Txt.NA)) +
+                    "   |   100 % = theoretical link, bottleneck line = measured limit";
             }
             else lblMonInfo.Text = "";
 
+            if (!ok) cardLimit.Set(Txt.NA, "", Theme.Text);
+            else if (mon.Measured)
+                cardLimit.Set(Gbs(mon.MeasRx) + " / " + Gbs(mon.MeasTx),
+                    "GB/s measured up / down = " + Pct(mon.MeasRx, capRx) + " / " + Pct(mon.MeasTx, capTx) + Txt.NL +
+                    TheoText(capRx), Theme.Accent);
+            else
+                cardLimit.Set("Not measured",
+                    "Measured when you start recording" + Txt.NL +
+                    TheoText(capRx), Theme.Text);
+
             if (last != null && mon.Running)
-                cardNow.Set(Gbs(last.Rx) + " / " + Gbs(last.Tx), "GB/s up / down  -  " + Pct(last.Rx, capRx) + " / " + Pct(last.Tx, capTx) + " of link" +
+                cardNow.Set(Gbs(last.Rx) + " / " + Gbs(last.Tx), "GB/s up / down" + Txt.NL + Pct(last.Rx, capRx) + " / " + Pct(last.Tx, capTx) + " of link" +
                     Txt.NL + "App: " + last.App, last.Saturated ? Theme.Red : Theme.Text);
             else cardNow.Set(Txt.NA, mon.Running ? "Waiting for data..." : "Not recording", Theme.Text);
 
             if (secs > 0)
             {
-                cardAvg.Set(Gbs(sumRx / secs) + " / " + Gbs(sumTx / secs), "GB/s up / down  -  " + Pct(sumRx / secs, capRx) + " / " + Pct(sumTx / secs, capTx) + " of link", Theme.Text);
+                cardAvg.Set(Gbs(sumRx / secs) + " / " + Gbs(sumTx / secs), "GB/s up / down" + Txt.NL + Pct(sumRx / secs, capRx) + " / " + Pct(sumTx / secs, capTx) + " of link", Theme.Text);
                 cardPeak.Set(Gbs(maxRx) + " / " + Gbs(maxTx), "Up at " + maxRxT.ToString("HH:mm:ss", Txt.Inv) + " (" + Pct(maxRx, capRx) + ")" + Txt.NL +
                     "Down at " + maxTxT.ToString("HH:mm:ss", Txt.Inv) + " (" + Pct(maxTx, capTx) + ")", Theme.Text);
                 cardSat.Set(sat.ToString(sat < 60 ? "0.0" : "0", Txt.Inv) + " s",
-                    (sat / secs * 100).ToString("0.0", Txt.Inv) + " % of " + Dur(secs) + "  -  " + epCount + " episode(s)" + (inEpisode ? Txt.NL + "Bottleneck right now" : ""),
+                    (sat / secs * 100).ToString("0.0", Txt.Inv) + " % of " + Dur(secs) + Txt.NL + epCount + " episode(s)" + (inEpisode ? Txt.NL + "Bottleneck right now" : ""),
                     sat > 0 ? Theme.Red : Theme.Green);
             }
             else
@@ -2929,6 +3188,8 @@ namespace GpuToggle
             Text = "Add running app";
             Font = Theme.Regular;
             BackColor = Theme.Surface;
+            ForeColor = Theme.Text;
+            Theme.Hook(this);
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
             ShowInTaskbar = false;
@@ -3007,12 +3268,20 @@ namespace GpuToggle
         string state = "Click Run test. It takes a few seconds and briefly loads the GPU.";
         double theoretical;
 
-        public BandwidthDialog(GpuInfo g)
+        bool autoRun;
+
+        // autoRun: start the test right away and close by itself once it succeeds
+        // (used by "Start recording" so the measured limit is in place before recording).
+        public BandwidthDialog(GpuInfo g, bool autoRun = false)
         {
             gpu = g;
+            this.autoRun = autoRun;
+            if (autoRun) Shown += delegate { Start(); };
             Text = "PCIe bandwidth - " + g.Name;
             Font = Theme.Regular;
             BackColor = Theme.Surface;
+            ForeColor = Theme.Text;
+            Theme.Hook(this);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
@@ -3141,6 +3410,15 @@ namespace GpuToggle
             ShowLink(chain, chain == r.Chain);
             state = null;
             results.Invalidate();
+            if (autoRun)
+            {
+                // Leave the numbers on screen for a moment, then continue to recording.
+                run.Enabled = false;
+                var t = new System.Windows.Forms.Timer();
+                t.Interval = 1500;
+                t.Tick += delegate { t.Dispose(); if (!IsDisposed) { DialogResult = DialogResult.OK; Close(); } };
+                t.Start();
+            }
         }
 
         void PaintResults(Graphics g)
@@ -3200,6 +3478,8 @@ namespace GpuToggle
             Text = "Keep this change?";
             Font = Theme.Regular;
             BackColor = Theme.Card;
+            ForeColor = Theme.Text;
+            Theme.Hook(this);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterScreen;
             TopMost = true;
@@ -3265,6 +3545,7 @@ namespace GpuToggle
             Application.SetCompatibleTextRenderingDefault(false);
             using (var g = Graphics.FromHwnd(IntPtr.Zero)) Ui.Scale = g.DpiX / 96f;
             Theme.Init();
+            Theme.LoadMode();
             Application.Run(new MainForm());
         }
     }
