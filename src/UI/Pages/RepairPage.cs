@@ -154,8 +154,19 @@ namespace GpuToggle
             cmbBrand.Items.AddRange(new object[] { "NVIDIA", "AMD" });
             cmbBrand.SelectedIndex = 0;
             cmbBrand.SelectedIndexChanged += delegate { brandChosen = true; };
+            // The theme makes combo boxes flat and card-colored: on a card they would have no visible edge.
+            var cmbFrame = new Panel();
+            cmbFrame.BackColor = Theme.Border;
+            cmbFrame.Padding = new Padding(1);
+            cmbFrame.AutoSize = true;
+            cmbFrame.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            cmbFrame.Margin = new Padding(0, Ui.S(1), 0, Ui.S(6));
+            cmbBrand.Font = Theme.Regular;
+            cmbBrand.Margin = new Padding(0);
+            cmbBrand.Location = new Point(1, 1);
+            cmbFrame.Controls.Add(cmbBrand);
             brandRow.Controls.Add(lbl);
-            brandRow.Controls.Add(cmbBrand);
+            brandRow.Controls.Add(cmbFrame);
             flow.Controls.Add(brandRow);
 
             chkRestore = Check("Create a restore point first", true);
