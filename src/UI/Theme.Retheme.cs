@@ -12,10 +12,15 @@ namespace GpuToggle
     {
         [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
-        // Dark title bar (Windows 10 20H1+ / 11). Lists keep the default theme: the Explorer list theme
-        // draws column divider lines through the owner-drawn rows.
+        // Dark title bar (Windows 10 20H1+ / 11) and dark scroll bars on lists, text boxes and scrolling panels.
         public static void Native(Control c)
         {
+            // Hidden pages create their handles later, and some controls recreate theirs: theme them then.
+            if (HasScrollBars(c) && hooked.Add(c))
+            {
+                c.HandleCreated += delegate { Native(c); };
+                c.Disposed += delegate { hooked.Remove(c); };
+            }
             if (!c.IsHandleCreated) return;
             try
             {
@@ -29,8 +34,23 @@ namespace GpuToggle
                     DwmSetWindowAttribute(c.Handle, 35, ref cap, 4);
                     DwmSetWindowAttribute(c.Handle, 36, ref txt, 4);
                 }
+                if (HasScrollBars(c))
+                {
+                    // Dark scroll bars. The sub id list keeps every lookup on the "ScrollBar" class, so
+                    // lists do not pick up the Explorer list theme (it draws column lines through the rows).
+                    if (Dark) SetWindowTheme(c.Handle, "DarkMode_Explorer", c is ListView ? "ScrollBar" : null);
+                    else SetWindowTheme(c.Handle, null, null);
+                }
             }
             catch { }
+        }
+
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] static extern int SetWindowTheme(IntPtr hwnd, string app, string idList);
+        static readonly HashSet<Control> hooked = new HashSet<Control>();
+
+        static bool HasScrollBars(Control c)
+        {
+            return c is ListView || c is TextBoxBase || (c is ScrollableControl && !(c is Form) && ((ScrollableControl)c).AutoScroll);
         }
 
         // Call once in every window's constructor: themes the title bar and the native controls.
