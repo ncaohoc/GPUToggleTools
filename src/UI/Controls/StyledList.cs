@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace GpuToggle
@@ -67,6 +68,29 @@ namespace GpuToggle
             DrawItem += delegate (object s, DrawListViewItemEventArgs e) { };
             DrawSubItem += OnSubItem;
             SelectedIndexChanged += delegate { Invalidate(); };
+        }
+
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+        [DllImport("user32.dll")] static extern bool ValidateRect(IntPtr hwnd, ref RECT r);
+
+        protected override void WndProc(ref Message m)
+        {
+            // The dark scroll bar theme (see Theme.Native) turns the column lines the list draws below the
+            // last row into size grips. Paint that empty area here and take it out of the list's own paint.
+            if (m.Msg == 0x0F)   // WM_PAINT
+            {
+                int top = Items.Count > 0 ? Items[Items.Count - 1].Bounds.Bottom : 0;
+                if (top < 0) top = 0;
+                if (top < ClientSize.Height)
+                {
+                    var empty = new Rectangle(0, top, ClientSize.Width, ClientSize.Height - top);
+                    using (var g = CreateGraphics())
+                    using (var br = new SolidBrush(BackColor)) g.FillRectangle(br, empty);
+                    var r = new RECT { Left = empty.Left, Top = empty.Top, Right = empty.Right, Bottom = empty.Bottom };
+                    ValidateRect(Handle, ref r);
+                }
+            }
+            base.WndProc(ref m);
         }
 
         protected override void OnResize(EventArgs e)

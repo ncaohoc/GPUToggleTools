@@ -18,6 +18,9 @@ namespace GpuToggle
         Button btnClean, btnSafe, btnFix43, btnCheck43;
         Label lbl43;
         TextBox txtLog;
+        TableLayoutPanel grid;
+        readonly List<FlowLayoutPanel> cardFlows = new List<FlowLayoutPanel>();
+        bool fitting;
         bool busy, wuSync, brandChosen, egpuChosen;
         List<GpuInfo> gpus = new List<GpuInfo>();
 
@@ -41,7 +44,7 @@ namespace GpuToggle
             // Delete the one-time Safe Mode boot entry once we are back in normal mode.
             ThreadPool.QueueUserWorkItem(delegate { try { SafeBoot.Cleanup(); } catch { } });
 
-            var grid = new TableLayoutPanel();
+            grid = new TableLayoutPanel();
             grid.Dock = DockStyle.Top;
             grid.Height = Ui.S(300);
             grid.ColumnCount = 2;
@@ -95,8 +98,38 @@ namespace GpuToggle
             flow.WrapContents = false;
             flow.AutoScroll = true;
             flow.BackColor = Theme.Card;
+            flow.Layout += delegate { FitCards(); };
+            cardFlows.Add(flow);
             p.Controls.Add(flow);
             return p;
+        }
+
+        // Wraps the notes to the card width and makes the two cards tall enough for their text, so the
+        // scroll bar only shows when the window is too small for that.
+        void FitCards()
+        {
+            if (fitting || grid == null || cardFlows.Count == 0) return;
+            fitting = true;
+            try
+            {
+                int extra = int.MinValue;
+                foreach (var f in cardFlows)
+                {
+                    int w = f.ClientSize.Width;
+                    if (w <= 0) return;
+                    foreach (Control c in f.Controls)
+                    {
+                        var l = c as Label;
+                        if (l == null) continue;
+                        int max = Math.Max(Ui.S(120), w - l.Margin.Horizontal);
+                        if (l.MaximumSize.Width != max) l.MaximumSize = new Size(max, 0);
+                    }
+                    extra = Math.Max(extra, f.GetPreferredSize(new Size(w, 0)).Height - f.ClientSize.Height);
+                }
+                int h = Math.Max(Ui.S(300), grid.Height + extra);
+                if (h != grid.Height) grid.Height = h;
+            }
+            finally { fitting = false; }
         }
 
         CheckBox Check(string text, bool on)
