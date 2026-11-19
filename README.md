@@ -196,3 +196,7 @@ Thêm trang mới: tạo class kế thừa `AppPage` trong `src/UI/Pages` rồi 
 - **Tắt iGPU làm màn hình gắn eGPU cũng tắt?** Trước khi tắt iGPU, bấm `Win + P` và chọn **Second screen only**. Bạn cũng nên kiểm tra ở *Settings → System → Display → Advanced display* rằng màn hình ngoài đang *Connected to* card eGPU. Nếu nó hiện iGPU, hãy cắm dây thẳng vào cổng trên card.
 - Màn hình đen: thử `Win + Ctrl + Shift + B`, rút ra cắm lại dây, hoặc chờ 15 giây để app tự bật lại GPU.
 - Nên tắt eGPU trong app trước khi rút dây eGPU.
+
+## Giấy phép
+
+Phát hành theo giấy phép [MIT](LICENSE): bạn được tự do dùng, sửa và phân phối lại, miễn là giữ thông báo bản quyền. Phần mềm được cung cấp "nguyên trạng", không kèm bảo hành.
