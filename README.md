@@ -17,6 +17,7 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 5 trang chuyển qua l
 - **PCIe monitor**: đồ thị băng thông PCIe thời gian thực khi chơi game, kèm nhật ký những lần bị nghẽn.
 - **OSD**: lớp thông số hiện đè lên game (FPS, GPU, VRAM, CPU, RAM, PCIe) và cho biết cái gì đang giới hạn FPS.
 - **Repair**: nhóm công cụ sửa lỗi: gỡ sạch driver NVIDIA / AMD và tự sửa lỗi Code 43 (xem bên dưới).
+- **Khay hệ thống**: khi bật **Start with Windows**, app chạy nền ở khay để tự Enable eGPU khi cắm vào (xem [Tự động hoá eGPU](#tự-động-hoá-egpu-trang-gpus-cột-egpu--auto-và-hàng-egpu)).
 - **Dark mode**: công tắc mặt trời / mặt trăng ở góc phải thanh tiêu đề. Lúc chưa bấm, app theo chế độ sáng/tối của Windows; đã bấm thì app nhớ lựa chọn (`HKCU/Software/GPUToggle`). Đổi ngay không cần mở lại app.
 
 ## Tính năng
@@ -104,6 +105,18 @@ Cửa sổ có thanh tiêu đề màu navy kèm logo, và 5 trang chuyển qua l
   - Khi tắt GPU vật lý cuối cùng còn chạy, app hiện cảnh báo, nút mặc định là **No**. Windows sẽ chuyển sang Microsoft Basic Display Adapter.
   - Sau khi tắt, app mở hộp đếm ngược **15 giây**. Nếu không bấm **Keep**, GPU tự bật lại, nên bạn không bị kẹt khi màn hình đen.
 
+### Tự động hoá eGPU (trang GPUs: cột eGPU / Auto và hàng **eGPU:**)
+
+Làm thay bạn thói quen *Disable trước khi tắt máy, Enable sau khi vào Windows* (xem [Lưu ý khi dùng eGPU](#lưu-ý-khi-dùng-egpu)).
+
+- Cột **eGPU** trong bảng Graphics adapters: bấm vào ô tick để đánh dấu card là eGPU. Card cắm sang cổng khác (Instance ID đổi phần cuối) vẫn được nhận ra.
+- Cột **Auto** (tự tick khi đánh dấu eGPU, bị mờ khi card chưa là eGPU): nếu eGPU đang Disabled thì app tự Enable khi **app khởi động** và mỗi khi eGPU **vừa được cắm vào**. Nếu bạn tự Disable eGPU trong lúc nó vẫn cắm thì app không bật lại.
+- **Start with Windows**: app tự chạy ẩn ở khay hệ thống (notification area) **ngay sau khi bạn đăng nhập**, tức là sau bước nhập PIN, nên việc Enable eGPU không làm Windows thấy phần cứng đổi lúc khởi động. App dùng một task trong Task Scheduler (`GPUToggle`, chạy với quyền cao nhất): Windows chỉ hỏi quyền Admin **một lần** lúc bật tuỳ chọn, các lần đăng nhập sau không hiện UAC. Khi tuỳ chọn này bật, nút X chỉ ẩn cửa sổ xuống khay; muốn thoát hẳn thì chuột phải icon ở khay → **Exit**. Khi tuỳ chọn này bật, mở app (double-click file exe) **không còn hiện UAC**: nếu app đang chạy thì cửa sổ đó hiện lên, nếu chưa thì app được mở qua task. Nếu bạn chuyển file exe sang chỗ khác, task tự cập nhật đường dẫn ở lần mở app tiếp theo.
+- **Safe shut down / Safe restart** (cũng có trong menu chuột phải ở khay): Disable mọi eGPU đã đánh dấu rồi tắt / khởi động lại máy như bình thường. App tắt máy hẳn (`shutdown /s /t 0`, không dùng Fast Startup) để lần sau eGPU khởi động sạch. Tắt máy xong thì rút dây eGPU.
+- **Disable eGPU on shut down** (mặc định bật): khi app đang chạy (vd. nhờ **Start with Windows**) mà bạn tắt hoặc khởi động lại máy theo cách thường (menu Start), app Disable eGPU trước rồi mới để Windows tắt. Đăng xuất (Sign out) thì không. Đây là cách dự phòng: Windows chỉ cho app vài giây, nên nút **Safe shut down** vẫn chắc chắn hơn.
+
+Quy trình gợi ý: đánh dấu eGPU + bật **Start with Windows** một lần. Sau đó: **Safe shut down** → rút eGPU → mở máy, đăng nhập → cắm eGPU, app tự Enable.
+
 ### Sửa lỗi (trang Repair)
 
 Các công cụ này can thiệp sâu vào hệ thống nên được gom riêng một trang, mọi bước đều ghi vào ô **Log** ở cuối trang.
@@ -143,7 +156,7 @@ Các công cụ này can thiệp sâu vào hệ thống nên được gom riêng
 
 - Windows 10 bản 2004 trở lên, hoặc Windows 11 (`pnputil /enable-device`).
 - .NET Framework 4.x, có sẵn trong Windows.
-- Quyền Administrator: app tự xin quyền khi mở.
+- Quyền Administrator: app tự xin quyền khi mở (UAC). Bật **Start with Windows** thì chỉ cần cấp quyền một lần.
 - Phần thông số NVIDIA cần driver NVIDIA, trong đó có `nvidia-smi` và `nvapi64.dll`.
 
 ## Build

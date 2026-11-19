@@ -11,8 +11,42 @@ namespace GpuToggle
 {
     class StyledList : ListView
     {
-        public Dictionary<int, string> ColumnKinds = new Dictionary<int, string>();   // "pill" or "bar"
+        public Dictionary<int, string> ColumnKinds = new Dictionary<int, string>();   // "pill", "bar" or "check"
         public Func<string, Color[]> PillStyle;                                       // text -> { background, foreground }
+
+        // "check" cells: text CheckOn / CheckOff draw a tick box, CheckDisabled a greyed one, "" nothing.
+        public const string CheckOn = "1", CheckOff = "0", CheckDisabled = "d";
+        // A tick box was clicked: row, column.
+        public event Action<ListViewItem, int> CheckClicked;
+
+        // Column under a point (client coordinates), -1 if none.
+        public int ColumnAt(Point p)
+        {
+            var hit = HitTest(p);
+            if (hit.Item == null || hit.SubItem == null) return -1;
+            return hit.Item.SubItems.IndexOf(hit.SubItem);
+        }
+
+        public bool IsCheckColumn(int col)
+        {
+            string k;
+            return col >= 0 && ColumnKinds.TryGetValue(col, out k) && k == "check";
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            var hit = HitTest(e.Location);
+            if (hit.Item == null || hit.SubItem == null) return;
+            int col = hit.Item.SubItems.IndexOf(hit.SubItem);
+            string t = hit.SubItem.Text;
+            if (IsCheckColumn(col) && (t == CheckOn || t == CheckOff) && CheckClicked != null)
+            {
+                hit.Item.Selected = true;
+                CheckClicked(hit.Item, col);
+            }
+        }
 
         public StyledList()
         {
@@ -77,6 +111,7 @@ namespace GpuToggle
             string kind;
             ColumnKinds.TryGetValue(e.ColumnIndex, out kind);
 
+            if (kind == "check") { if (text.Length > 0) DrawCheck(g, inner, text == CheckOn, text == CheckDisabled); return; }
             if (kind == "pill" && text.Length > 0 && text != Txt.NA) { DrawPill(g, inner, text); return; }
             float v;
             if (kind == "bar" && LeadingNumber(text, out v)) { DrawBar(g, inner, text, v); return; }
@@ -86,6 +121,36 @@ namespace GpuToggle
             Font f = e.ColumnIndex == 0 ? Theme.Semibold : Theme.Regular;
             TextRenderer.DrawText(g, text, f, inner, fg,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        }
+
+        void DrawCheck(Graphics g, Rectangle inner, bool on, bool disabled)
+        {
+            int s = Ui.S(16);
+            var r = new Rectangle(inner.X + Ui.S(2), inner.Y + (inner.Height - s) / 2, s, s);
+            var old = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var path = Theme.Round(r, Ui.S(3)))
+            {
+                if (on)
+                    using (var br = new SolidBrush(Theme.Accent)) g.FillPath(br, path);
+                else
+                {
+                    using (var br = new SolidBrush(disabled ? Theme.RowAlt : Theme.Card)) g.FillPath(br, path);
+                    using (var pen = new Pen(disabled ? Theme.Border : Theme.Muted, Math.Max(1f, Ui.S(1)))) g.DrawPath(pen, path);
+                }
+            }
+            if (on)
+            {
+                using (var pen = new Pen(Color.White, Math.Max(2f, Ui.S(2))))
+                {
+                    pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round; pen.LineJoin = LineJoin.Round;
+                    g.DrawLines(pen, new PointF[] {
+                        new PointF(r.X + s * 0.24f, r.Y + s * 0.52f),
+                        new PointF(r.X + s * 0.43f, r.Y + s * 0.70f),
+                        new PointF(r.X + s * 0.77f, r.Y + s * 0.32f) });
+                }
+            }
+            g.SmoothingMode = old;
         }
 
         void DrawPill(Graphics g, Rectangle inner, string text)

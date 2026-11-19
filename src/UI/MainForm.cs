@@ -32,9 +32,26 @@ namespace GpuToggle
         System.Windows.Forms.Timer debounce;
         StatsPoller stats;
 
-        public MainForm()
+        // Background mode: started at sign-in (hidden) or "Start with Windows" is on. The window then
+        // closes to the notification area so the app can enable the eGPU when it is plugged in.
+        const int WM_QUERYENDSESSION = 0x0011;
+        const long ENDSESSION_LOGOFF = 0x80000000L;
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        static extern bool ShutdownBlockReasonCreate(IntPtr hwnd, string reason);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool ShutdownBlockReasonDestroy(IntPtr hwnd);
+
+        public static readonly string WindowTitle = "GPU Toggle v" + AppVersion.Text;
+        readonly bool startHidden;
+        bool allowShow, inited, exiting, endSessionDone, trayHintShown;
+        NotifyIcon tray;
+
+        bool Background { get { return startHidden || LogonTask.Enabled; } }
+
+        public MainForm(bool startHidden)
         {
-            Text = "GPU Toggle v" + AppVersion.Text;
+            this.startHidden = startHidden;
+            Text = WindowTitle;
             Font = Theme.Regular;
             BackColor = Theme.Surface;
             ForeColor = Theme.Text;
@@ -83,23 +100,126 @@ namespace GpuToggle
                 if (appsPage.Visible) appsPage.RefreshApps();
             };
 
-            Shown += delegate
+            BuildTray();
+            gpusPage.Notify += delegate (string text, bool error)
             {
-                ShowPage(SafeBoot.InSafeMode ? pages.IndexOf(repairPage) : 0);
-                gpusPage.RefreshList();
-                appsPage.RefreshApps();
-                stats.Start();
+                if (!Visible && tray.Visible && text.Length > 0)
+                    tray.ShowBalloonTip(5000, "GPU Toggle", text, error ? ToolTipIcon.Warning : ToolTipIcon.Info);
             };
-            FormClosing += delegate
+            gpusPage.RunAtLogonChanged += delegate { tray.Visible = Background; };
+            gpusPage.SafePowerStarting += delegate { endSessionDone = true; };
+
+            Shown += delegate { InitOnce(); };
+            // Stats are only needed while the window is on screen.
+            VisibleChanged += delegate { if (Visible) stats.Start(); else stats.Stop(); };
+            FormClosing += delegate (object s, FormClosingEventArgs e)
             {
+                if (!exiting && Background && e.CloseReason == CloseReason.UserClosing)
+                {
+                    e.Cancel = true;
+                    HideToTray();
+                    return;
+                }
                 stats.Stop();
                 foreach (var p in pages) p.Shutdown();
+                tray.Visible = false;
             };
+        }
+
+        void InitOnce()
+        {
+            if (inited) return;
+            inited = true;
+            ShowPage(SafeBoot.InSafeMode ? pages.IndexOf(repairPage) : 0);
+            gpusPage.RefreshList();   // also enables a disabled eGPU marked "Enable it automatically"
+            appsPage.RefreshApps();
+            if (LogonTask.Enabled) LogonTask.FixPath();
+        }
+
+        // Started at sign-in: stay hidden (only the tray icon) until the user opens the window.
+        protected override void SetVisibleCore(bool value)
+        {
+            if (startHidden && !allowShow)
+            {
+                value = false;
+                if (!IsHandleCreated)
+                {
+                    CreateHandle();
+                    BeginInvoke((MethodInvoker)InitOnce);
+                }
+            }
+            base.SetVisibleCore(value);
+        }
+
+        void BuildTray()
+        {
+            tray = new NotifyIcon();
+            tray.Text = "GPU Toggle";
+            try { tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { tray.Icon = SystemIcons.Application; }
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("Open GPU Toggle", null, delegate { ShowFromTray(); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("eGPU safe shut down...", null, delegate { ShowFromTray(); gpusPage.SafePower(false); });
+            menu.Items.Add("eGPU safe restart...", null, delegate { ShowFromTray(); gpusPage.SafePower(true); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("Exit", null, delegate { exiting = true; Close(); });
+            menu.Items[0].Font = Theme.Semibold;
+            tray.ContextMenuStrip = menu;
+            tray.MouseClick += delegate (object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ShowFromTray(); };
+            tray.Visible = Background;
+            FormClosed += delegate { tray.Visible = false; tray.Dispose(); };
+        }
+
+        void ShowFromTray()
+        {
+            allowShow = true;
+            Show();
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            Activate();
+        }
+
+        void HideToTray()
+        {
+            tray.Visible = true;
+            Hide();
+            if (!trayHintShown)
+            {
+                trayHintShown = true;
+                tray.ShowBalloonTip(4000, "GPU Toggle is still running",
+                    "It enables the eGPU when you plug it in. Right-click the icon for Safe shut down or Exit.", ToolTipIcon.Info);
+            }
+        }
+
+        // Windows is shutting down / restarting (Start menu, not our Safe shut down): disable the marked eGPUs first.
+        void OnQueryEndSession(long flags)
+        {
+            if (endSessionDone || (flags & ENDSESSION_LOGOFF) != 0 || !EgpuSettings.DisableOnShutdown) return;
+            endSessionDone = true;
+            try
+            {
+                var gpus = GpuDevices.Scan();
+                bool any = false;
+                foreach (var g in Egpu.Marked(gpus)) if (g.Enabled) any = true;
+                if (!any) return;
+                ShutdownBlockReasonCreate(Handle, "Disabling the eGPU before Windows shuts down...");
+                string log;
+                Egpu.DisableAll(gpus, out log);
+                ShutdownBlockReasonDestroy(Handle);
+            }
+            catch { }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            SingleInstance.AllowShowMessage(Handle);
         }
 
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == WM_DEVICECHANGE && debounce != null) { debounce.Stop(); debounce.Start(); }
+            if (m.Msg == WM_QUERYENDSESSION) OnQueryEndSession(m.LParam.ToInt64());
+            if (m.Msg == SingleInstance.ShowMessage && SingleInstance.ShowMessage != 0) ShowFromTray();
             base.WndProc(ref m);
         }
 
