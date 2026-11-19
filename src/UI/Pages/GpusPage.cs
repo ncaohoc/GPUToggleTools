@@ -18,6 +18,7 @@ namespace GpuToggle
         List<GpuInfo> gpus = new List<GpuInfo>();
         HashSet<string> present;   // instance IDs seen by the last scan (null before the first one)
         bool busy, syncing;
+        bool active;   // this page is the one shown (Visible is false while the window is hidden in the tray)
         string lastDispSig = "";
 
         // After every rescan, with all adapters (also disabled and virtual ones).
@@ -36,6 +37,9 @@ namespace GpuToggle
         {
             get { return list.Items.Count + " GPU(s) found. Double-click a row to toggle. Stats refresh every 2 s."; }
         }
+
+        public override void OnActivated() { active = true; }
+        public override void OnDeactivated() { active = false; }
 
         public bool Busy { get { return busy; } }
         public List<GpuInfo> Gpus { get { return gpus; } }
@@ -217,7 +221,7 @@ namespace GpuToggle
             list.EndUpdate();
             list.StretchLast();
 
-            if (Visible) SetStatus(StatusHint);
+            if (active) SetStatus(StatusHint);
             UpdateButtons();
             if (GpusChanged != null) GpusChanged(gpus);
             if (arrived.Count > 0 && !busy) AutoEnable(arrived);
