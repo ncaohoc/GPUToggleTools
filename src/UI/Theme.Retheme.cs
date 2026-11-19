@@ -94,9 +94,9 @@ namespace GpuToggle
             var b = c as Button;
             if (b != null && styles.ContainsKey(b)) StyleButton(b, map);
             var cb = c as ComboBox;
-            if (cb != null) { cb.FlatStyle = FlatStyle.Flat; cb.BackColor = Card; cb.ForeColor = Text; }
+            if (cb != null) { cb.FlatStyle = FlatStyle.Flat; cb.BackColor = Card; cb.ForeColor = Text; EdgePainter.Attach(cb); }
             var nu = c as NumericUpDown;
-            if (nu != null) { nu.BackColor = Card; nu.ForeColor = Text; nu.BorderStyle = BorderStyle.FixedSingle; }
+            if (nu != null) { nu.BackColor = Card; nu.ForeColor = Text; nu.BorderStyle = BorderStyle.FixedSingle; EdgePainter.Attach(nu); }
             var tb = c as TextBox;
             if (tb != null) { tb.BackColor = Card; tb.ForeColor = Text; }
             if (c is ListView) { c.BackColor = Card; c.ForeColor = Text; }

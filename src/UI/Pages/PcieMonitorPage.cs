@@ -86,9 +86,7 @@ namespace GpuToggle
             bar.Controls.Add(btnMonReset);
             bar.Controls.Add(btnMonMeasure);
             bar.Controls.Add(btnMonExport);
-            bar.Controls.Add(lblThr);
-            bar.Controls.Add(numThr);
-            bar.Controls.Add(lblPct);
+            bar.Controls.Add(Theme.Group(lblThr, numThr, lblPct));
 
             lblMonInfo = new Label();
             lblMonInfo.Dock = DockStyle.Top;

@@ -113,6 +113,20 @@ namespace GpuToggle
             return p;
         }
 
+        // Keeps a label and its field on one line when a toolbar wraps.
+        public static FlowLayoutPanel Group(params Control[] items)
+        {
+            var g = new FlowLayoutPanel();
+            g.AutoSize = true;
+            g.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            g.WrapContents = false;
+            g.Margin = new Padding(0);
+            g.Padding = new Padding(0);
+            g.BackColor = Surface;
+            g.Controls.AddRange(items);
+            return g;
+        }
+
         public static FlowLayoutPanel Toolbar()
         {
             var f = new FlowLayoutPanel();

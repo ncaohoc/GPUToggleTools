@@ -102,15 +102,11 @@ namespace GpuToggle
             bar.Controls.Add(lblGpu);
             bar.Controls.Add(cmbOsdGpu);
             bar.Controls.Add(btnOsdShow);
-            bar.Controls.Add(OsdLabelCtl("Position:"));
-            bar.Controls.Add(cmbOsdPos);
-            bar.Controls.Add(OsdLabelCtl("Size:"));
-            bar.Controls.Add(cmbOsdSize);
-            bar.Controls.Add(OsdLabelCtl("Background:"));
-            bar.Controls.Add(numOsdAlpha);
             var pct = OsdLabelCtl("%");
             pct.Margin = new Padding(0, Ui.S(8), 0, 0);
-            bar.Controls.Add(pct);
+            bar.Controls.Add(Theme.Group(OsdLabelCtl("Position:"), cmbOsdPos));
+            bar.Controls.Add(Theme.Group(OsdLabelCtl("Size:"), cmbOsdSize));
+            bar.Controls.Add(Theme.Group(OsdLabelCtl("Background:"), numOsdAlpha, pct));
 
             var bar2 = Theme.Toolbar();
             var lblShow = OsdLabelCtl("Show on the OSD:");
@@ -204,10 +200,23 @@ namespace GpuToggle
             gap2.Height = Ui.S(10);
             gap2.BackColor = Theme.Surface;
 
+            // The text is taller than the space left on smaller windows: it scrolls (scroll bar only when needed).
+            var helpBox = new Panel();
+            helpBox.BackColor = Theme.Card;
+            helpBox.AutoScroll = true;
+            helpBox.Padding = new Padding(Ui.S(12), Ui.S(10), Ui.S(4), Ui.S(10));
             var help = new Label();
+            help.AutoSize = true;
             help.BackColor = Theme.Card;
             help.ForeColor = Theme.Text;
-            help.Padding = new Padding(Ui.S(12), Ui.S(10), Ui.S(12), Ui.S(10));
+            help.Location = new System.Drawing.Point(Ui.S(12), Ui.S(10));
+            help.Margin = new Padding(0, 0, 0, Ui.S(10));
+            helpBox.Controls.Add(help);
+            helpBox.Layout += delegate
+            {
+                int w = helpBox.ClientSize.Width - Ui.S(12) - Ui.S(8);
+                if (w > 0 && help.MaximumSize.Width != w) help.MaximumSize = new System.Drawing.Size(w, 0);
+            };
             string nl = Txt.NL;
             help.Text =
                 "GPU-bound (GPU >= 95 %): the normal case. For more FPS lower resolution / settings or use DLSS / FSR." + nl +
@@ -218,7 +227,7 @@ namespace GpuToggle
                 "FPS comes from the present events Windows logs (ETW), nothing is injected into the game: DirectX 9 - 12, Vulkan / OpenGL through the kernel graphics events. " +
                 "The OSD measures the app in the foreground. It is a click-through topmost window, so it shows over windowed and borderless games; exclusive fullscreen can hide it (switch the game to borderless). " +
                 "PCIe traffic needs an NVIDIA GPU (NVML); run PCIe bandwidth... once so 100 % is the measured limit. CPU temperature: LibreHardwareMonitor if it is running, else the ACPI thermal zone.";
-            var helpSection = Theme.Section("How to read it", "Hotkey Ctrl+Shift+O shows / hides the OSD from inside the game", Theme.CardAround(help));
+            var helpSection = Theme.Section("How to read it", "Hotkey Ctrl+Shift+O shows / hides the OSD from inside the game", Theme.CardAround(helpBox));
 
             Controls.Add(helpSection);
             Controls.Add(gap2);

@@ -20,7 +20,7 @@ namespace GpuToggle
         TextBox txtLog;
         TableLayoutPanel grid;
         readonly List<FlowLayoutPanel> cardFlows = new List<FlowLayoutPanel>();
-        bool fitting;
+        bool fitting, fitQueued;
         bool busy, wuSync, brandChosen, egpuChosen;
         List<GpuInfo> gpus = new List<GpuInfo>();
 
@@ -98,7 +98,7 @@ namespace GpuToggle
             flow.WrapContents = false;
             flow.AutoScroll = true;
             flow.BackColor = Theme.Card;
-            flow.Layout += delegate { FitCards(); };
+            flow.Layout += delegate { QueueFit(); };
             cardFlows.Add(flow);
             p.Controls.Add(flow);
             return p;
@@ -106,6 +106,34 @@ namespace GpuToggle
 
         // Wraps the notes to the card width and makes the two cards tall enough for their text, so the
         // scroll bar only shows when the window is too small for that.
+        // Runs after the current layout pass: changing the grid height inside it leaves the cards at
+        // their old height (cut off at the bottom, over the Log section).
+        void QueueFit()
+        {
+            if (fitting || fitQueued) return;
+            if (!IsHandleCreated) { FitCards(); return; }
+            fitQueued = true;
+            BeginInvoke((MethodInvoker)delegate { fitQueued = false; FitCards(); });
+        }
+
+        // A check box does not wrap its text by itself: give it a fixed size when the text needs two lines.
+        static void WrapCheck(CheckBox c, int max)
+        {
+            int glyph = Ui.S(20);
+            int one = TextRenderer.MeasureText(c.Text, c.Font).Width + glyph;
+            if (one <= max)
+            {
+                if (!c.AutoSize) { c.AutoSize = true; c.CheckAlign = ContentAlignment.MiddleLeft; c.TextAlign = ContentAlignment.MiddleLeft; }
+                return;
+            }
+            var flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix;
+            int h = TextRenderer.MeasureText(c.Text, c.Font, new Size(max - glyph, 0), flags).Height + Ui.S(4);
+            c.AutoSize = false;
+            c.CheckAlign = ContentAlignment.TopLeft;
+            c.TextAlign = ContentAlignment.TopLeft;
+            if (c.Size != new Size(max, h)) c.Size = new Size(max, h);
+        }
+
         void FitCards()
         {
             if (fitting || grid == null || cardFlows.Count == 0) return;
@@ -119,15 +147,14 @@ namespace GpuToggle
                     if (w <= 0) return;
                     foreach (Control c in f.Controls)
                     {
-                        var l = c as Label;
-                        if (l == null) continue;
-                        int max = Math.Max(Ui.S(120), w - l.Margin.Horizontal);
-                        if (l.MaximumSize.Width != max) l.MaximumSize = new Size(max, 0);
+                        int max = Math.Max(Ui.S(120), w - c.Margin.Horizontal);
+                        if (c is Label) { if (c.MaximumSize.Width != max) c.MaximumSize = new Size(max, 0); }
+                        else if (c is CheckBox) WrapCheck((CheckBox)c, max);
                     }
                     extra = Math.Max(extra, f.GetPreferredSize(new Size(w, 0)).Height - f.ClientSize.Height);
                 }
                 int h = Math.Max(Ui.S(300), grid.Height + extra);
-                if (h != grid.Height) grid.Height = h;
+                if (h != grid.Height) { grid.Height = h; grid.PerformLayout(); }
             }
             finally { fitting = false; }
         }
@@ -187,19 +214,10 @@ namespace GpuToggle
             cmbBrand.Items.AddRange(new object[] { "NVIDIA", "AMD" });
             cmbBrand.SelectedIndex = 0;
             cmbBrand.SelectedIndexChanged += delegate { brandChosen = true; };
-            // The theme makes combo boxes flat and card-colored: on a card they would have no visible edge.
-            var cmbFrame = new Panel();
-            cmbFrame.BackColor = Theme.Border;
-            cmbFrame.Padding = new Padding(1);
-            cmbFrame.AutoSize = true;
-            cmbFrame.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            cmbFrame.Margin = new Padding(0, Ui.S(1), 0, Ui.S(6));
             cmbBrand.Font = Theme.Regular;
-            cmbBrand.Margin = new Padding(0);
-            cmbBrand.Location = new Point(1, 1);
-            cmbFrame.Controls.Add(cmbBrand);
+            cmbBrand.Margin = new Padding(0, Ui.S(2), 0, Ui.S(6));   // the theme draws its edge (EdgePainter)
             brandRow.Controls.Add(lbl);
-            brandRow.Controls.Add(cmbFrame);
+            brandRow.Controls.Add(cmbBrand);
             flow.Controls.Add(brandRow);
 
             chkRestore = Check("Create a restore point first", true);
